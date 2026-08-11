@@ -46,7 +46,7 @@ func (s *Snapshotter) retryDBOperation(ctx context.Context, operation func() err
 	retryDelay := 1 * time.Second
 
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := range maxRetries {
 		if attempt > 0 {
 			// Exponential backoff
 			delay := retryDelay * time.Duration(1<<uint(attempt-1))
@@ -100,15 +100,13 @@ func isTransientError(err error) bool {
 
 	// 2. Check for pgconn connection errors
 	// These occur during initial connection or when connection is lost
-	var connectErr *pgconn.ConnectError
-	if goerrors.As(err, &connectErr) {
+	if _, ok := goerrors.AsType[*pgconn.ConnectError](err); ok {
 		return true
 	}
 
 	// 3. Check for PostgreSQL-specific transient errors
 	// Reference: https://www.postgresql.org/docs/current/errcodes-appendix.html
-	var pgErr *pgconn.PgError
-	if goerrors.As(err, &pgErr) {
+	if pgErr, ok := goerrors.AsType[*pgconn.PgError](err); ok {
 		switch pgErr.Code {
 		case "40001": // serialization_failure
 			return true
@@ -140,8 +138,7 @@ func isTransientError(err error) bool {
 	}
 
 	// 6. Check for specific syscall errors (low-level network errors)
-	var netErr *net.OpError
-	if goerrors.As(err, &netErr) {
+	if netErr, ok := goerrors.AsType[*net.OpError](err); ok {
 		// ECONNREFUSED, ECONNRESET, EPIPE are transient
 		if goerrors.Is(netErr.Err, syscall.ECONNREFUSED) ||
 			goerrors.Is(netErr.Err, syscall.ECONNRESET) ||
@@ -170,8 +167,7 @@ func isInvalidSnapshotError(err error) bool {
 	}
 
 	// Check for PostgreSQL error code 22023 (invalid_parameter_value) with snapshot message
-	var pgErr *pgconn.PgError
-	if goerrors.As(err, &pgErr) {
+	if pgErr, ok := goerrors.AsType[*pgconn.PgError](err); ok {
 		if pgErr.Code == "22023" && strings.Contains(strings.ToLower(pgErr.Message), "invalid snapshot identifier") {
 			return true
 		}

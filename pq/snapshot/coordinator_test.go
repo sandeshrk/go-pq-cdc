@@ -8,7 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func ptrInt64(v int64) *int64 { return &v }
+//go:fix inline
+func ptrInt64(v int64) *int64 { return new(v) }
 
 func TestAndCondition(t *testing.T) {
 	t.Run("both empty returns empty", func(t *testing.T) {

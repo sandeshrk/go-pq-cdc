@@ -133,7 +133,7 @@ func decodePublicationInfoResult(result *pgconn.Result) (*Config, error) {
 	return &publicationConfig, nil
 }
 
-func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
+func decodeTextColumnData(data []byte, dataType uint32) (any, error) {
 	if dt, ok := typeMap.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}

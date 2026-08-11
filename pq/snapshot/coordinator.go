@@ -782,12 +782,9 @@ func (s *Snapshotter) createRangeChunksWithConn(ctx context.Context, conn pq.Con
 	numChunks := integerRangeChunkCount(minValue, maxValue, chunkSize)
 	chunks := make([]*Chunk, 0, numChunks)
 
-	for i := int64(0); i < numChunks; i++ {
+	for i := range numChunks {
 		rangeStart := minValue + (i * chunkSize)
-		rangeEnd := rangeStart + chunkSize - 1
-		if rangeEnd > maxValue {
-			rangeEnd = maxValue
-		}
+		rangeEnd := min(rangeStart+chunkSize-1, maxValue)
 
 		startValue := rangeStart
 		endValue := rangeEnd
@@ -832,10 +829,7 @@ func integerRangeIsSparse(numChunks, rowCount, chunkSize int64) bool {
 		return false
 	}
 	idealChunks := (rowCount + chunkSize - 1) / chunkSize
-	threshold := idealChunks * 2
-	if threshold < 1 {
-		threshold = 1
-	}
+	threshold := max(idealChunks*2, 1)
 	return numChunks > threshold
 }
 
@@ -884,15 +878,12 @@ func (s *Snapshotter) createCTIDBlockChunksWithConn(ctx context.Context, conn pq
 		estimatedRowsPerBlock = 100 // Safe default
 	}
 
-	blocksPerChunk := s.config.ChunkSize / estimatedRowsPerBlock
-	if blocksPerChunk < 1 {
-		blocksPerChunk = 1
-	}
+	blocksPerChunk := max(s.config.ChunkSize/estimatedRowsPerBlock, 1)
 
 	numChunks := (totalBlocks + blocksPerChunk - 1) / blocksPerChunk
 	chunks := make([]*Chunk, 0, numChunks)
 
-	for i := int64(0); i < numChunks; i++ {
+	for i := range numChunks {
 		blockStart := i * blocksPerChunk
 		blockEnd := blockStart + blocksPerChunk
 		isLastChunk := (i == numChunks-1)
@@ -994,7 +985,7 @@ func (s *Snapshotter) createOffsetChunksWithConn(ctx context.Context, conn pq.Co
 	numChunks := (rowCount + chunkSize - 1) / chunkSize
 	chunks := make([]*Chunk, 0, numChunks)
 
-	for i := int64(0); i < numChunks; i++ {
+	for i := range numChunks {
 		// Last chunk may have fewer rows (handles estimate vs actual difference)
 		chunk := &Chunk{
 			SlotName:          slotName,
@@ -1147,10 +1138,7 @@ func (s *Snapshotter) saveChunksBatch(ctx context.Context, chunks []*Chunk) erro
 
 	// Process chunks in batches
 	for i := 0; i < len(chunks); i += chunkBatchSize {
-		end := i + chunkBatchSize
-		if end > len(chunks) {
-			end = len(chunks)
-		}
+		end := min(i+chunkBatchSize, len(chunks))
 		batch := chunks[i:end]
 
 		if err := s.insertChunkBatch(ctx, batch); err != nil {
