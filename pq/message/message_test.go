@@ -21,7 +21,7 @@ func TestNewDecodesTruncate(t *testing.T) {
 		0, 0, 0, 42,
 	}
 
-	msg, err := New(data, false, now, relations)
+	msg, err := New(data, false, now, relations, false)
 
 	require.NoError(t, err)
 	truncate, ok := msg.(*format.Truncate)
@@ -49,7 +49,7 @@ func TestNewDecodesStreamedRelation(t *testing.T) {
 		1, 'i', 'd', 0, 0, 0, 0, 23, 255, 255, 255, 255,
 	}
 
-	msg, err := New(data, true, time.Now(), relations)
+	msg, err := New(data, true, time.Now(), relations, false)
 
 	require.NoError(t, err)
 	rel, ok := msg.(*format.Relation)

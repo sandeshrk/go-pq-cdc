@@ -22,7 +22,9 @@ type Data struct {
 	ColumnNumber uint16
 }
 
-type DataColumns []*DataColumn
+// DataColumns holds columns by value, not by pointer: one contiguous
+// allocation instead of one heap object per column.
+type DataColumns []DataColumn
 
 type DataColumn struct {
 	Data     []byte
@@ -49,12 +51,24 @@ func NewData(data []byte, tupleDataType uint8, skipByteLength int) (*Data, error
 	return d, nil
 }
 
+// Decode parses one row's column headers and values out of data, starting at
+// skipByteLength. data is the connection's shared read buffer -- valid only
+// until the next message is received -- so every non-null column's payload
+// must still be copied out here, never aliased.
+//
+// d.Columns is preallocated once instead of grown via repeated append, and
+// each column is written in place instead of boxed in a separate *DataColumn
+// (see DataColumns) -- removing one heap allocation per column, which showed
+// up as a dominant contributor in CDC ingestion heap profiles under high WAL
+// throughput. The per-column payload copy is unchanged: it is still required
+// because data is reused by the connection after this call returns.
 func (d *Data) Decode(data []byte, skipByteLength int) {
 	d.ColumnNumber = binary.BigEndian.Uint16(data[skipByteLength:])
 	skipByteLength += 2
 
-	for range d.ColumnNumber {
-		col := new(DataColumn)
+	d.Columns = make(DataColumns, d.ColumnNumber)
+	for i := range d.Columns {
+		col := &d.Columns[i]
 		col.DataType = data[skipByteLength]
 		skipByteLength++
 
@@ -69,8 +83,6 @@ func (d *Data) Decode(data []byte, skipByteLength int) {
 
 			skipByteLength += int(col.Length)
 		}
-
-		d.Columns = append(d.Columns, col)
 	}
 	d.SkipByte = skipByteLength
 }
