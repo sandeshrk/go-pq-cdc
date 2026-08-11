@@ -12,7 +12,7 @@ type TypeDecoder struct {
 }
 
 // Decode decodes column data using the cached decoder
-func (d *TypeDecoder) Decode(typeMap *pgtype.Map, data []byte) (interface{}, error) {
+func (d *TypeDecoder) Decode(typeMap *pgtype.Map, data []byte) (any, error) {
 	if dt, ok := typeMap.TypeForOID(d.oid); ok {
 		return dt.Codec.DecodeValue(typeMap, d.oid, pgtype.TextFormatCode, data)
 	}

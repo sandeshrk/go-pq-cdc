@@ -29,8 +29,8 @@ type serializeProbeConn struct {
 	fe        *pgproto3.Frontend
 	keepalive []byte
 
-	active   int32 // in-flight read-or-write ops; must never exceed 1
-	overlaps int32
+	active   atomic.Int32 // in-flight read-or-write ops; must never exceed 1
+	overlaps atomic.Int32
 	stop     atomic.Bool
 }
 
@@ -38,11 +38,11 @@ type serializeProbeConn struct {
 // in flight, holds briefly to widen the overlap window, and returns a closure
 // that records the end.
 func (c *serializeProbeConn) mark() func() {
-	if atomic.AddInt32(&c.active, 1) != 1 {
-		atomic.AddInt32(&c.overlaps, 1)
+	if c.active.Add(1) != 1 {
+		c.overlaps.Add(1)
 	}
 	time.Sleep(20 * time.Microsecond)
-	return func() { atomic.AddInt32(&c.active, -1) }
+	return func() { c.active.Add(-1) }
 }
 
 func (c *serializeProbeConn) Connect(context.Context) error                          { return nil }
@@ -88,20 +88,16 @@ func TestStandbyUpdateIsSerializedWithReceive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		s.sinkLoop(ctx, &messageBuffer{outCh: make(chan *Message, 4096)}, &streamTxBuffer{})
-	}()
+	})
 
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 4 {
+		wg.Go(func() {
 			for ctx.Err() == nil {
 				_ = s.sendStandbyStatusUpdate(ctx)
 			}
-		}()
+		})
 	}
 
 	time.Sleep(200 * time.Millisecond)
@@ -114,7 +110,7 @@ func TestStandbyUpdateIsSerializedWithReceive(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	if got := atomic.LoadInt32(&c.overlaps); got != 0 {
+	if got := c.overlaps.Load(); got != 0 {
 		t.Fatalf("read and standby-update write overlapped %d time(s); connMu did not serialize connection access", got)
 	}
 }

@@ -49,8 +49,7 @@ func (tdb *TimescaleDB) FindHyperTables(ctx context.Context) (map[string]string,
 	resultReader := tdb.conn.Exec(ctx, query)
 	results, err := resultReader.ReadAll()
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if goerrors.As(err, &pgErr) {
+		if pgErr, ok := goerrors.AsType[*pgconn.PgError](err); ok {
 			if pgErr.Code == "42P01" {
 				tdb.ticker.Stop()
 				logger.Debug("timescale db hypertable relation not found", "error", err)
@@ -115,7 +114,7 @@ func decodeHyperTablesResult(results []*pgconn.Result) (map[string]string, error
 	return res, nil
 }
 
-func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
+func decodeTextColumnData(data []byte, dataType uint32) (any, error) {
 	if dt, ok := typeMap.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}

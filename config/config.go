@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -340,13 +341,7 @@ func (s *SnapshotConfig) Validate() error {
 	}
 
 	validModes := []SnapshotMode{SnapshotModeInitial, SnapshotModeNever, SnapshotModeSnapshotOnly}
-	isValid := false
-	for _, mode := range validModes {
-		if s.Mode == mode {
-			isValid = true
-			break
-		}
-	}
+	isValid := slices.Contains(validModes, s.Mode)
 	if !isValid {
 		return errors.New("snapshot mode must be 'initial', 'never', or 'snapshot_only'")
 	}
