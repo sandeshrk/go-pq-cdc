@@ -450,7 +450,7 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	s.UpdateXLogPos(xld.ServerWALEnd)
 	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
 
-	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation)
+	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation, s.config.SkipTupleMapDecode)
 	if err != nil || decodedMsg == nil {
 		logger.Debug("wal data message parsing error", "error", err)
 		return

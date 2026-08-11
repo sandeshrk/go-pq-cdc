@@ -37,7 +37,7 @@ func TestInsert_New(t *testing.T) {
 	}
 
 	now := time.Now()
-	msg, err := NewInsert(data, false, rel, now)
+	msg, err := NewInsert(data, false, rel, now, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,4 +60,28 @@ func TestInsert_New(t *testing.T) {
 	}
 
 	assert.Equal(t, expected, msg)
+}
+
+func TestInsert_New_SkipMapDecode(t *testing.T) {
+	data := []byte{73, 0, 0, 64, 6, 78, 0, 2, 116, 0, 0, 0, 3, 54, 48, 53, 116, 0, 0, 0, 3, 102, 111, 111}
+
+	rel := map[uint32]*Relation{
+		16390: {
+			OID:           16390,
+			Namespace:     "public",
+			Name:          "t",
+			ColumnNumbers: 2,
+			Columns: []tuple.RelationColumn{
+				{Name: "id", DataType: 23, TypeModifier: 4294967295},
+				{Name: "name", DataType: 25, TypeModifier: 4294967295},
+			},
+		},
+	}
+
+	msg, err := NewInsert(data, false, rel, time.Now(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Nil(t, msg.Decoded)
 }

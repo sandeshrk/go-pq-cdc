@@ -39,18 +39,20 @@ type Type uint8
 // XID prefix. The caller owns that state (it flips on the StreamStart/StreamStop/
 // StreamCommit/StreamAbort messages this function returns) — it must NOT be
 // process-global, since one process may run several replication streams.
-func New(data []byte, streamedTransaction bool, serverTime time.Time, relation map[uint32]*format.Relation) (any, error) {
+// skipMapDecode forwards config.Config.SkipTupleMapDecode to Insert/Update/
+// Delete messages; other message types ignore it.
+func New(data []byte, streamedTransaction bool, serverTime time.Time, relation map[uint32]*format.Relation, skipMapDecode bool) (any, error) {
 	switch Type(data[0]) {
 	case BeginByte:
 		return format.NewBegin(data)
 	case CommitByte:
 		return format.NewCommit(data)
 	case InsertByte:
-		return format.NewInsert(data, streamedTransaction, relation, serverTime)
+		return format.NewInsert(data, streamedTransaction, relation, serverTime, skipMapDecode)
 	case UpdateByte:
-		return format.NewUpdate(data, streamedTransaction, relation, serverTime)
+		return format.NewUpdate(data, streamedTransaction, relation, serverTime, skipMapDecode)
 	case DeleteByte:
-		return format.NewDelete(data, streamedTransaction, relation, serverTime)
+		return format.NewDelete(data, streamedTransaction, relation, serverTime, skipMapDecode)
 	case TruncateByte:
 		return format.NewTruncate(data, streamedTransaction, relation, serverTime)
 	case StreamStartByte:
