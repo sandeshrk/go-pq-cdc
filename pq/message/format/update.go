@@ -29,7 +29,7 @@ type Update struct {
 	OldTupleType   uint8
 }
 
-func NewUpdate(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time) (*Update, error) {
+func NewUpdate(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time, skipMapDecode bool) (*Update, error) {
 	msg := &Update{
 		MessageTime: serverTime,
 	}
@@ -45,18 +45,20 @@ func NewUpdate(data []byte, streamedTransaction bool, relation map[uint32]*Relat
 	msg.TableNamespace = rel.Namespace
 	msg.TableName = rel.Name
 
-	var err error
+	if !skipMapDecode {
+		var err error
 
-	if msg.OldTupleData != nil {
-		msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns)
+		if msg.OldTupleData != nil {
+			msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		msg.NewDecoded, err = msg.NewTupleData.DecodeWithColumn(rel.Columns)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	msg.NewDecoded, err = msg.NewTupleData.DecodeWithColumn(rel.Columns)
-	if err != nil {
-		return nil, err
 	}
 
 	return msg, nil

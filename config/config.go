@@ -30,6 +30,12 @@ type Config struct {
 	Metric           MetricConfig       `json:"metric" yaml:"metric"`
 	DebugMode        bool               `json:"debugMode" yaml:"debugMode"`
 	ExtensionSupport ExtensionSupport   `json:"extensionSupport" yaml:"extensionSupport"`
+	// SkipTupleMapDecode skips building the Decoded/NewDecoded/OldDecoded map
+	// on Insert/Update/Delete messages (see format package). Off by default
+	// to preserve existing behavior; a consumer that resolves columns
+	// directly from TupleData/NewTupleData/OldTupleData can enable it to
+	// avoid the extra allocation and decode pass this map costs per row.
+	SkipTupleMapDecode bool `json:"skipTupleMapDecode" yaml:"skipTupleMapDecode"`
 }
 
 type MetricConfig struct {

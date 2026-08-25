@@ -21,7 +21,7 @@ type Delete struct {
 	OldTupleType   uint8
 }
 
-func NewDelete(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time) (*Delete, error) {
+func NewDelete(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time, skipMapDecode bool) (*Delete, error) {
 	msg := &Delete{
 		MessageTime: serverTime,
 	}
@@ -37,11 +37,13 @@ func NewDelete(data []byte, streamedTransaction bool, relation map[uint32]*Relat
 	msg.TableNamespace = rel.Namespace
 	msg.TableName = rel.Name
 
-	var err error
+	if !skipMapDecode {
+		var err error
 
-	msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns)
-	if err != nil {
-		return nil, err
+		msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return msg, nil

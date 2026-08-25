@@ -24,7 +24,7 @@ type Insert struct {
 	XID            uint32
 }
 
-func NewInsert(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time) (*Insert, error) {
+func NewInsert(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time, skipMapDecode bool) (*Insert, error) {
 	msg := &Insert{
 		MessageTime: serverTime,
 	}
@@ -40,12 +40,12 @@ func NewInsert(data []byte, streamedTransaction bool, relation map[uint32]*Relat
 	msg.TableNamespace = rel.Namespace
 	msg.TableName = rel.Name
 
-	msg.Decoded = make(map[string]any)
-
-	var err error
-	msg.Decoded, err = msg.TupleData.DecodeWithColumn(rel.Columns)
-	if err != nil {
-		return nil, err
+	if !skipMapDecode {
+		var err error
+		msg.Decoded, err = msg.TupleData.DecodeWithColumn(rel.Columns)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return msg, nil
