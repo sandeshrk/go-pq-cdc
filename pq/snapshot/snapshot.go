@@ -291,7 +291,7 @@ func (s *Snapshotter) stopSnapshotKeepalive() {
 }
 
 // decodeColumnData decodes PostgreSQL column data using cached decoder
-func (s *Snapshotter) decodeColumnData(data []byte, dataTypeOID uint32) (interface{}, error) {
+func (s *Snapshotter) decodeColumnData(data []byte, dataTypeOID uint32) (any, error) {
 	// Use cached decoder (optimization: avoid reflection overhead)
 	decoder := s.decoderCache.Get(dataTypeOID)
 	return decoder.Decode(s.typeMap, data)

@@ -666,8 +666,7 @@ func isReplicationConnectionTerminationError(err error) bool {
 }
 
 func isPostgresShutdownError(err error) bool {
-	var pgErr *pgconn.PgError
-	if goerrors.As(err, &pgErr) {
+	if pgErr, ok := goerrors.AsType[*pgconn.PgError](err); ok {
 		switch pgErr.Code {
 		case postgresAdminShutdown, postgresCrashShutdown:
 			return true

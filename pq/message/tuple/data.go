@@ -106,7 +106,7 @@ func (d *Data) DecodeWithColumn(columns []RelationColumn) (map[string]any, error
 	return decoded, nil
 }
 
-func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
+func decodeTextColumnData(data []byte, dataType uint32) (any, error) {
 	if dt, ok := typeMap.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}
