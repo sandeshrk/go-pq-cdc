@@ -25,7 +25,7 @@ type Update struct {
 	TableNamespace string
 	TableName      string
 	LSN            pq.LSN
-	CommitLSN      pq.LSN // transaction end position
+	CommitLSN      pq.LSN // LSN of the transaction's commit record
 	OID            uint32
 	XID            uint32
 	OldTupleType   uint8
