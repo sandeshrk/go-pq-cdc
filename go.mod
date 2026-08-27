@@ -1,6 +1,6 @@
 module github.com/Trendyol/go-pq-cdc
 
-go 1.26.5
+go 1.27.0
 
 require (
 	github.com/avast/retry-go/v4 v4.6.0
