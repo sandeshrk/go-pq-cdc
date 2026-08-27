@@ -51,6 +51,7 @@ func main() {
 			Name:                        "cdc_slot_streaming",
 			SlotActivityCheckerInterval: 3000,
 			ProtoVersion:                2,
+			Streaming:                   true,
 		},
 		Metric: config.MetricConfig{
 			Port: 8081,

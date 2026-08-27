@@ -20,24 +20,36 @@ func New(conn pq.Connection) *Replication {
 	return &Replication{conn: conn}
 }
 
-func (r *Replication) Start(publicationName, slotName string, startLSN pq.LSN, protoVersion int) error {
-	pluginArguments := []string{
-		fmt.Sprintf("proto_version '%d'", protoVersion),
-	}
-
-	if protoVersion >= 2 {
-		pluginArguments = append(pluginArguments, "messages 'true'", "streaming 'true'")
-	}
-
-	pluginArguments = append(pluginArguments, "publication_names '"+publicationName+"'")
-
-	sql := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (%s)", slotName, startLSN, strings.Join(pluginArguments, ","))
+func (r *Replication) Start(publicationName, slotName string, startLSN pq.LSN, protoVersion int, streaming, messages bool) error {
+	sql := buildStartReplicationSQL(slotName, publicationName, startLSN, protoVersion, streaming, messages)
 	r.conn.Frontend().SendQuery(&pgproto3.Query{String: sql})
 	err := r.conn.Frontend().Flush()
 	if err != nil {
 		return errors.Wrap(err, "start replication")
 	}
 	return nil
+}
+
+// buildStartReplicationSQL builds the START_REPLICATION command. streaming
+// and messages are only sent for protoVersion >= 2: proto_version 2 permits
+// them, but neither is implied by it, so a caller must opt in to each.
+func buildStartReplicationSQL(slotName, publicationName string, startLSN pq.LSN, protoVersion int, streaming, messages bool) string {
+	pluginArguments := []string{
+		fmt.Sprintf("proto_version '%d'", protoVersion),
+	}
+
+	if protoVersion >= 2 {
+		if messages {
+			pluginArguments = append(pluginArguments, "messages 'true'")
+		}
+		if streaming {
+			pluginArguments = append(pluginArguments, "streaming 'true'")
+		}
+	}
+
+	pluginArguments = append(pluginArguments, "publication_names '"+publicationName+"'")
+
+	return fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (%s)", slotName, startLSN, strings.Join(pluginArguments, ","))
 }
 
 func (r *Replication) Test(ctx context.Context) error {

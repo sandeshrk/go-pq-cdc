@@ -33,6 +33,7 @@ func TestStreamingTransactionRollback(t *testing.T) {
 	cdcCfg := Config
 	cdcCfg.Slot.Name = slotName
 	cdcCfg.Slot.ProtoVersion = 2
+	cdcCfg.Slot.Streaming = true
 
 	postgresConn, err := newPostgresConn()
 	if !assert.NoError(t, err) {
@@ -120,6 +121,7 @@ func TestStreamingRollbackThenCommit(t *testing.T) {
 	cdcCfg := Config
 	cdcCfg.Slot.Name = slotName
 	cdcCfg.Slot.ProtoVersion = 2
+	cdcCfg.Slot.Streaming = true
 
 	postgresConn, err := newPostgresConn()
 	if !assert.NoError(t, err) {

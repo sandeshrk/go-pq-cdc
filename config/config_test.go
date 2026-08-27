@@ -553,6 +553,20 @@ func TestSnapshotConfigValidateQueryCondition(t *testing.T) {
 	})
 }
 
+func TestSetDefaultProtoVersion(t *testing.T) {
+	t.Run("defaults to 1 when unset", func(t *testing.T) {
+		cfg := &Config{}
+		cfg.SetDefault()
+		assert.Equal(t, 1, cfg.Slot.ProtoVersion)
+	})
+
+	t.Run("leaves an explicit value untouched", func(t *testing.T) {
+		cfg := &Config{Slot: slot.Config{ProtoVersion: 2}}
+		cfg.SetDefault()
+		assert.Equal(t, 2, cfg.Slot.ProtoVersion)
+	})
+}
+
 func TestValidateHeartbeatInPublication(t *testing.T) {
 	validBase := func() Config {
 		return Config{
