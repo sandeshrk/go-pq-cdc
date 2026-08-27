@@ -79,6 +79,14 @@ type stream struct {
 	sinkStarted         atomic.Bool
 	processStarted      atomic.Bool
 	openFromSnapshotLSN bool
+	// txCommit holds the commit context of the non-streamed transaction
+	// currently being decoded, so each of its change messages can be stamped
+	// with it. Written and read only on the sink (reader) goroutine.
+	txCommit struct {
+		time time.Time
+		lsn  pq.LSN
+		xid  uint32
+	}
 }
 
 func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
@@ -208,6 +216,7 @@ func (b *messageBuffer) flush() {
 // to the given transaction-end LSN. Used at COMMIT.
 func (b *messageBuffer) flushWithLSN(lsn pq.LSN) {
 	if b.pending != nil {
+		markLastInTransaction(b.pending.message)
 		if !b.send(&Message{
 			message:  b.pending.message,
 			walStart: int64(lsn),
@@ -271,13 +280,17 @@ func (s *streamTxBuffer) stopTx() {
 
 // flushTx emits every accumulated message for the given XID through outCh.
 // The last message's WAL position is rewritten to the transaction-end LSN.
-func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN pq.LSN) {
+// Every message is stamped with the STREAM COMMIT's commit context, since a
+// streamed transaction has no BEGIN to capture it from up front.
+func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN pq.LSN, commitTime time.Time) {
 	s.streaming = false
 	msgs := s.txns[xid]
 	n := len(msgs)
 	for i, msg := range msgs {
+		stampCommit(msg.message, commitTime, endLSN, xid)
 		out := msg
 		if i == n-1 {
+			markLastInTransaction(msg.message)
 			out = &Message{
 				message:  msg.message,
 				walStart: int64(endLSN),
@@ -468,7 +481,44 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 		m.LSN = xld.WALStart
 	}
 
+	// Streamed changes have no BEGIN to draw commit context from; they are
+	// stamped later, at STREAM COMMIT, in streamTxBuffer.flushTx.
+	if !streamBuf.streaming {
+		if stampCommit(decodedMsg, s.txCommit.time, s.txCommit.lsn, s.txCommit.xid) && s.txCommit.time.IsZero() {
+			logger.Warn("change message has no preceding transaction commit context", "lsn", xld.WALStart.String())
+		}
+	}
+
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
+}
+
+// stampCommit sets the transaction commit context on a DML change message.
+// It reports whether msg was a DML message.
+func stampCommit(msg any, commitTime time.Time, commitLSN pq.LSN, xid uint32) bool {
+	switch m := msg.(type) {
+	case *format.Insert:
+		m.CommitTime, m.CommitLSN, m.XID = commitTime, commitLSN, xid
+	case *format.Update:
+		m.CommitTime, m.CommitLSN, m.XID = commitTime, commitLSN, xid
+	case *format.Delete:
+		m.CommitTime, m.CommitLSN, m.XID = commitTime, commitLSN, xid
+	default:
+		return false
+	}
+	return true
+}
+
+// markLastInTransaction flags a DML change message as the final one emitted
+// for its transaction.
+func markLastInTransaction(msg any) {
+	switch m := msg.(type) {
+	case *format.Insert:
+		m.LastInTransaction = true
+	case *format.Update:
+		m.LastInTransaction = true
+	case *format.Delete:
+		m.LastInTransaction = true
+	}
 }
 
 // dispatchMessage routes a decoded logical replication event to the correct
@@ -485,6 +535,9 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
 	switch msg := decodedMsg.(type) {
 	case *format.Begin:
+		s.txCommit.time = msg.CommitTime
+		s.txCommit.lsn = msg.FinalLSN
+		s.txCommit.xid = msg.Xid
 		buf.discard()
 
 	case *format.Commit:
@@ -501,7 +554,7 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 
 	case *format.StreamCommit:
 		// Final commit of a streamed transaction – emit all messages for this XID.
-		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN)
+		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN, msg.CommitTime)
 
 	case *format.StreamAbort:
 		// Streamed transaction rolled back – discard messages for this XID.
