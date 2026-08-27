@@ -17,6 +17,7 @@ const (
 
 type Update struct {
 	MessageTime    time.Time
+	CommitTime     time.Time // transaction commit time, from BEGIN or STREAM COMMIT
 	NewTupleData   *tuple.Data
 	NewDecoded     map[string]any
 	OldTupleData   *tuple.Data
@@ -24,9 +25,13 @@ type Update struct {
 	TableNamespace string
 	TableName      string
 	LSN            pq.LSN
+	CommitLSN      pq.LSN // transaction end position
 	OID            uint32
 	XID            uint32
 	OldTupleType   uint8
+	// LastInTransaction is true on the final change of its transaction, scoped
+	// to this slot's publication (see design notes on cross-slot reassembly).
+	LastInTransaction bool
 }
 
 func NewUpdate(data []byte, streamedTransaction bool, relation map[uint32]*Relation, serverTime time.Time, skipMapDecode bool) (*Update, error) {
