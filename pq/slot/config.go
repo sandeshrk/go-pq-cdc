@@ -10,9 +10,19 @@ type Config struct {
 	Name                        string        `json:"name" yaml:"name"`
 	SlotActivityCheckerInterval time.Duration `json:"slotActivityCheckerInterval" yaml:"slotActivityCheckerInterval"`
 	// ProtoVersion selects the pgoutput logical replication protocol version.
-	//   1 – compatible with PostgreSQL 10+; no streaming transaction support.
-	//   2 – requires PostgreSQL 14+; supports streaming large in-progress transactions (default).
-	ProtoVersion      int  `json:"protoVersion" yaml:"protoVersion"`
+	//   1 – compatible with PostgreSQL 10+; no streaming transaction support (default).
+	//   2 – requires PostgreSQL 14+; enables Streaming/Messages below.
+	ProtoVersion int `json:"protoVersion" yaml:"protoVersion"`
+	// Streaming enables PostgreSQL sending a large in-progress transaction's
+	// changes before it commits (requires ProtoVersion 2). Off by default: the
+	// driver must buffer an in-progress transaction's messages in memory until
+	// STREAM COMMIT/ABORT, with no upper bound, so only enable this once the
+	// workload's largest transactions are known to fit in memory.
+	Streaming bool `json:"streaming" yaml:"streaming"`
+	// Messages enables delivery of generic logical decoding messages emitted
+	// via pg_logical_emit_message (requires ProtoVersion 2). This driver does
+	// not decode them; off by default.
+	Messages          bool `json:"messages" yaml:"messages"`
 	CreateIfNotExists bool `json:"createIfNotExists" yaml:"createIfNotExists"`
 }
 
