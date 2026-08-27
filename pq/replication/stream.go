@@ -279,15 +279,16 @@ func (s *streamTxBuffer) stopTx() {
 }
 
 // flushTx emits every accumulated message for the given XID through outCh.
-// The last message's WAL position is rewritten to the transaction-end LSN.
-// Every message is stamped with the STREAM COMMIT's commit context, since a
-// streamed transaction has no BEGIN to capture it from up front.
-func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN pq.LSN, commitTime time.Time) {
+// The last message's WAL position is rewritten to the transaction-end LSN
+// (endLSN). Every message is stamped with commitLSN, the commit record's own
+// LSN, matching what BEGIN.FinalLSN supplies on the non-streamed path -- the
+// two positions are not the same value.
+func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN, commitLSN pq.LSN, commitTime time.Time) {
 	s.streaming = false
 	msgs := s.txns[xid]
 	n := len(msgs)
 	for i, msg := range msgs {
-		stampCommit(msg.message, commitTime, endLSN, xid)
+		stampCommit(msg.message, commitTime, commitLSN, xid)
 		out := msg
 		if i == n-1 {
 			markLastInTransaction(msg.message)
@@ -554,7 +555,7 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 
 	case *format.StreamCommit:
 		// Final commit of a streamed transaction – emit all messages for this XID.
-		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN, msg.CommitTime)
+		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN, msg.CommitLSN, msg.CommitTime)
 
 	case *format.StreamAbort:
 		// Streamed transaction rolled back – discard messages for this XID.

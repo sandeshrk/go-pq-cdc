@@ -163,7 +163,11 @@ func TestStreamedTransactionStampsCommitContextAtStreamCommit(t *testing.T) {
 	s.dispatchMessage(insert1, XLogData{WALStart: 500}, buf, streamBuf)
 	s.dispatchMessage(insert2, XLogData{WALStart: 600}, buf, streamBuf)
 	s.dispatchMessage(&format.StreamStop{}, XLogData{}, buf, streamBuf)
-	s.dispatchMessage(&format.StreamCommit{Xid: 42, TransactionEndLSN: 700, CommitTime: commitTime}, XLogData{}, buf, streamBuf)
+	// CommitLSN (the commit record's own position) and TransactionEndLSN (a
+	// slightly later position) are deliberately distinct here to prove the
+	// two are not conflated: only the latter may rewrite the acknowledgement
+	// position, only the former is stamped onto each message.
+	s.dispatchMessage(&format.StreamCommit{Xid: 42, TransactionEndLSN: 700, CommitLSN: 690, CommitTime: commitTime}, XLogData{}, buf, streamBuf)
 
 	require.Len(t, out, 2)
 	first := <-out
@@ -176,7 +180,8 @@ func TestStreamedTransactionStampsCommitContextAtStreamCommit(t *testing.T) {
 
 	assert.Equal(t, commitTime, insert1.CommitTime)
 	assert.Equal(t, commitTime, insert2.CommitTime)
-	assert.Equal(t, pq.LSN(700), insert1.CommitLSN)
+	assert.Equal(t, pq.LSN(690), insert1.CommitLSN)
+	assert.Equal(t, pq.LSN(690), insert2.CommitLSN)
 	assert.Equal(t, uint32(42), insert1.XID)
 	assert.False(t, insert1.LastInTransaction)
 	assert.True(t, insert2.LastInTransaction)
