@@ -123,6 +123,9 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 
 	tdb, err := initializeTimescaleDB(ctx, cfg)
 	if err != nil {
+		if snapshotter != nil {
+			snapshotter.Close(ctx)
+		}
 		return nil, err
 	}
 
@@ -285,6 +288,13 @@ func (c *connector) Start(ctx context.Context) {
 
 	// Normal CDC flow (unchanged for backward compatibility)
 	c.CaptureSlot(ctx)
+
+	// CaptureSlot also returns when ctx is cancelled; stop rather than fail the
+	// remaining steps with a cancelled context.
+	if ctx.Err() != nil {
+		logger.Info("slot capture cancelled")
+		return
+	}
 
 	if err := c.stream.Connect(ctx); err != nil {
 		logger.Error("stream connection failed", "error", err)
@@ -644,7 +654,13 @@ func (c *connector) CaptureSlot(ctx context.Context) {
 	logger.Info("slot capturing...")
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
 		info, err := c.slot.Info(ctx)
 		if err != nil {
 			if goerrors.Is(err, slot.ErrorSlotClosed) {

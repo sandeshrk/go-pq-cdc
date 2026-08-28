@@ -60,12 +60,15 @@ func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publi
 
 	healthcheckConn, err := pq.NewConnection(ctx, dsn)
 	if err != nil {
+		_ = metadataConn.Close(ctx)
 		return nil, errors.Wrap(err, "create healthcheck connection")
 	}
 
 	// Create connection pool for chunk processing (5 connections)
 	connectionPool, err := NewConnectionPool(ctx, dsn, 5)
 	if err != nil {
+		_ = metadataConn.Close(ctx)
+		_ = healthcheckConn.Close(ctx)
 		return nil, errors.Wrap(err, "create connection pool")
 	}
 

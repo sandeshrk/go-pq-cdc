@@ -125,6 +125,12 @@ func (s *Slot) Info(ctx context.Context) (*Info, error) {
 }
 
 func (s *Slot) infoLocked(ctx context.Context) (*Info, error) {
+	// Callers poll this for the process lifetime, so re-dial here: without it a
+	// single dropped connection makes every later call fail with "conn closed".
+	if err := s.conn.Connect(ctx); err != nil {
+		return nil, errors.Wrap(err, "replication slot info connect")
+	}
+
 	resultReader := s.conn.Exec(ctx, s.statusSQL)
 	results, err := resultReader.ReadAll()
 	if err != nil {
@@ -148,7 +154,13 @@ func (s *Slot) infoLocked(ctx context.Context) (*Info, error) {
 }
 
 func (s *Slot) Metrics(ctx context.Context) {
-	for range s.ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.ticker.C:
+		}
+
 		if s.closed.Load() {
 			return
 		}
