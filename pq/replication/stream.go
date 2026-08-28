@@ -440,12 +440,18 @@ func (s *stream) reconnect(ctx context.Context) bool {
 
 		s.resetForReconnect()
 
+		// setup() talks to s.conn's frontend directly (START_REPLICATION,
+		// then the handshake read in replication.Test), same as Connect just
+		// did. Unlike the very first setup() call from Open (before sink/
+		// process exist), this one runs from the live sink goroutine while
+		// Close() can be called concurrently by the application at any time
+		// -- so the lock must cover setup() too, not just Close+Connect.
 		s.connMu.Lock()
+		defer s.connMu.Unlock()
+
 		_ = s.conn.Close(ctx)
-		connErr := s.conn.Connect(ctx)
-		s.connMu.Unlock()
-		if connErr != nil {
-			return connErr
+		if err := s.conn.Connect(ctx); err != nil {
+			return err
 		}
 
 		return s.setup(ctx)
