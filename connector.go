@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,12 +27,23 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	"github.com/avast/retry-go/v4"
 	"github.com/go-playground/errors"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Connector interface {
 	Start(ctx context.Context)
+	// Run blocks until shutdown, returning nil on a clean signal-driven or
+	// caller-context-cancelled shutdown, or the fatal error that stopped the
+	// pipeline (a bootstrap failure, or a recovered panic from one of the
+	// connector's background goroutines). Start is a thin wrapper around Run
+	// that discards the error, for backward compatibility.
+	//
+	// A connector is one-shot: once Run/Start returns for any reason, a
+	// second call returns ErrConnectorConsumed immediately. Build a new
+	// connector to retry.
+	Run(ctx context.Context) error
 	WaitUntilReady(ctx context.Context) error
 	Close()
 	GetConfig() *config.Config
@@ -47,11 +59,18 @@ type connector struct {
 	slot               *slot.Slot
 	cancelCh           chan os.Signal
 	readyCh            chan struct{}
-	cfg                *config.Config
-	snapshotter        *snapshot.Snapshotter
-	listenerFunc       replication.ListenerFunc
-	once               sync.Once
-	closeOnce          sync.Once
+	// fatalCh receives a recovered panic from any of the connector's
+	// background goroutines (see runGuarded), so Run can report it instead of
+	// the whole process crashing invisibly to the caller.
+	fatalCh      chan error
+	cfg          *config.Config
+	snapshotter  *snapshot.Snapshotter
+	listenerFunc replication.ListenerFunc
+	once         sync.Once
+	closeOnce    sync.Once
+	// consumed makes Run one-shot: internal latches (closeOnce, messageCH,
+	// signal registration) cannot be safely reused across a second call.
+	consumed atomic.Bool
 }
 
 func NewConnectorWithConfigFile(ctx context.Context, configFilePath string, listenerFunc replication.ListenerFunc) (Connector, error) {
@@ -141,6 +160,7 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 		listenerFunc:       listenerFunc,
 		cancelCh:           make(chan os.Signal, 1),
 		readyCh:            make(chan struct{}, 1),
+		fatalCh:            make(chan error, 4),
 	}, nil
 }
 
@@ -174,6 +194,7 @@ func newSnapshotOnlyConnector(ctx context.Context, cfg config.Config, listenerFu
 		listenerFunc:       listenerFunc,
 		cancelCh:           make(chan os.Signal, 1),
 		readyCh:            make(chan struct{}, 1),
+		fatalCh:            make(chan error, 4),
 		// CDC components left nil: system, stream, slot
 	}, nil
 }
@@ -242,9 +263,53 @@ func initializeSnapshot(ctx context.Context, cfg config.Config, tables publicati
 	return snapshot.New(ctx, cfg.Snapshot, tables, cfg.DSN(), m)
 }
 
+// ErrConnectorConsumed is returned by Run/Start when called on a connector
+// that has already run once (Run/Start already returned, for any reason).
+// A connector is one-shot: internal latches (closeOnce, the stream's
+// messageCH, OS signal registration) cannot be safely reused. Build a new
+// connector via NewConnector to retry.
+//
+// This is a plain stdlib error (not go-playground/errors.Chain) deliberately
+// -- Chain is a slice type, which stdlib errors.Is/As treat as non-comparable
+// and so can never match, even against the exact same value. Callers are
+// meant to check this with errors.Is, so it must stay a stdlib error.
+var ErrConnectorConsumed = goerrors.New("connector already consumed by a previous Run/Start call; build a new one")
+
+// Start is a thin wrapper around Run that discards the error, kept for
+// backward compatibility with existing callers.
 func (c *connector) Start(ctx context.Context) {
+	_ = c.Run(ctx)
+}
+
+func (c *connector) Run(ctx context.Context) error {
+	if !c.consumed.CompareAndSwap(false, true) {
+		return ErrConnectorConsumed
+	}
+	return c.run(ctx)
+}
+
+// runGuarded runs fn in its own goroutine, recovering any panic and
+// funnelling it into fatalCh instead of letting it crash the whole process
+// invisibly to Run's caller.
+func (c *connector) runGuarded(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("%s panicked: %v", name, r)
+				logger.Error("recovered panic in background goroutine", "goroutine", name, "error", err)
+				select {
+				case c.fatalCh <- err:
+				default:
+				}
+			}
+		}()
+		fn()
+	}()
+}
+
+func (c *connector) run(ctx context.Context) error {
 	c.once.Do(func() {
-		go c.server.Listen()
+		c.runGuarded("http server", c.server.Listen)
 	})
 
 	// Snapshot-only mode: execute snapshot and exit
@@ -252,15 +317,15 @@ func (c *connector) Start(ctx context.Context) {
 		// Check if snapshot already completed (resume capability)
 		if !c.shouldTakeSnapshotOnly(ctx) {
 			logger.Info("snapshot-only already completed, exiting")
-			return
+			return nil
 		}
 
 		if err := c.executeSnapshotOnly(ctx); err != nil {
 			logger.Error("snapshot-only execution failed", "error", err)
-			return
+			return errors.Wrap(err, "snapshot-only execution")
 		}
 		logger.Info("snapshot-only completed successfully, exiting")
-		return
+		return nil
 	}
 
 	// Snapshot Pre-phase (optional): Prepare → CreateSlot → Execute
@@ -268,7 +333,7 @@ func (c *connector) Start(ctx context.Context) {
 	if c.cfg.Snapshot.Enabled && c.shouldTakeSnapshot(ctx) {
 		if err := c.prepareSnapshotAndSlot(ctx); err != nil {
 			logger.Error("snapshot preparation failed", "error", err)
-			return
+			return errors.Wrap(err, "snapshot preparation")
 		}
 	} else {
 		// No snapshot: Create slot normally before starting CDC
@@ -276,60 +341,87 @@ func (c *connector) Start(ctx context.Context) {
 		slotInfo, err := c.slot.Create(ctx)
 		if err != nil {
 			logger.Error("slot creation failed", "error", err)
-			return
+			return errors.Wrap(err, "slot creation")
 		}
 		logger.Info("slot info", "info", slotInfo)
 	}
 
 	if err := c.slot.Connect(ctx); err != nil {
 		logger.Error("slot connection failed", "error", err)
-		return
+		return errors.Wrap(err, "slot connection")
 	}
 
-	// Normal CDC flow (unchanged for backward compatibility)
-	c.CaptureSlot(ctx)
-
-	// CaptureSlot also returns when ctx is cancelled; stop rather than fail the
-	// remaining steps with a cancelled context.
-	if ctx.Err() != nil {
-		logger.Info("slot capture cancelled")
-		return
-	}
-
-	if err := c.stream.Connect(ctx); err != nil {
-		logger.Error("stream connection failed", "error", err)
-		return
-	}
-
-	err := c.stream.Open(ctx)
-	if err != nil {
-		if goerrors.Is(err, replication.ErrorSlotInUse) {
-			logger.Info("capture failed")
-			c.Start(ctx)
-			return
+	if err := c.captureAndOpenStream(ctx); err != nil {
+		if ctx.Err() != nil {
+			logger.Info("slot capture cancelled")
+			return ctx.Err()
 		}
-		logger.Error("postgres stream open", "error", err)
-		return
+		return err
 	}
 
 	logger.Info("slot captured")
-	go c.slot.Metrics(ctx)
+	c.runGuarded("slot metrics", func() { c.slot.Metrics(ctx) })
 
 	// Start heartbeat loop only for CDC mode when enabled
 	if c.heartbeat != nil {
-		go c.heartbeat.Run(ctx)
+		c.runGuarded("heartbeat", func() { c.heartbeat.Run(ctx) })
 	}
 
 	if c.timescaleDB != nil {
-		go c.timescaleDB.SyncHyperTables(ctx)
+		c.runGuarded("timescaledb sync", func() { c.timescaleDB.SyncHyperTables(ctx) })
 	}
 
 	signal.Notify(c.cancelCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGABRT, syscall.SIGQUIT)
 
 	c.readyCh <- struct{}{}
 
-	<-c.cancelCh
-	logger.Debug("cancel channel triggered")
+	select {
+	case <-c.cancelCh:
+		logger.Debug("cancel channel triggered")
+		return nil
+	case err := <-c.fatalCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// captureAndOpenStream waits for the replication slot to become available
+// and opens the replication stream. If the slot is actively held by another
+// process (ErrorSlotInUse), it retries CaptureSlot+Connect+Open with backoff
+// bounded only by ctx, rather than unboundedly recursing back into the top
+// of Start/run: that would also redo slot creation and snapshot prep on
+// every retry, which is wasteful and, for snapshot mode, wrong.
+func (c *connector) captureAndOpenStream(ctx context.Context) error {
+	return retry.Do(func() error {
+		c.CaptureSlot(ctx)
+		if ctx.Err() != nil {
+			return retry.Unrecoverable(ctx.Err())
+		}
+
+		if err := c.stream.Connect(ctx); err != nil {
+			logger.Error("stream connection failed", "error", err)
+			return retry.Unrecoverable(errors.Wrap(err, "stream connection"))
+		}
+
+		if err := c.stream.Open(ctx); err != nil {
+			if goerrors.Is(err, replication.ErrorSlotInUse) {
+				logger.Info("capture failed, slot in use, retrying")
+				return err
+			}
+			logger.Error("postgres stream open", "error", err)
+			return retry.Unrecoverable(errors.Wrap(err, "postgres stream open"))
+		}
+		return nil
+	},
+		retry.Context(ctx),
+		retry.Attempts(0), // unbounded by count; ctx is the only ceiling
+		retry.DelayType(retry.BackOffDelay),
+		retry.Delay(time.Second),
+		retry.MaxDelay(30*time.Second),
+		retry.RetryIf(func(err error) bool { return goerrors.Is(err, replication.ErrorSlotInUse) }),
+		retry.LastErrorOnly(true),
+	)
 }
 
 func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
@@ -600,6 +692,11 @@ func (c *connector) WaitUntilReady(ctx context.Context) error {
 func (c *connector) Close() {
 	// Make close idempotent
 	c.closeOnce.Do(func() {
+		// Mark the connector consumed so a Run/Start call made after Close
+		// (whether Run already returned or never started) fails fast with
+		// ErrConnectorConsumed instead of running against closed resources.
+		c.consumed.Store(true)
+
 		// Create a context with timeout for graceful cleanup
 		// 30 seconds should be sufficient for closing connections and cleanup operations
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
