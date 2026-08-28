@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,8 +30,16 @@ type Config struct {
 	Snapshot         SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
 	Port             int                `json:"port" yaml:"port"`
 	Metric           MetricConfig       `json:"metric" yaml:"metric"`
-	DebugMode        bool               `json:"debugMode" yaml:"debugMode"`
-	ExtensionSupport ExtensionSupport   `json:"extensionSupport" yaml:"extensionSupport"`
+	// ConnectTimeout bounds establishing a connection. Without it a blackholed
+	// host is bounded only by the OS TCP timeout. Defaults to 10s.
+	ConnectTimeout time.Duration `json:"connectTimeout" yaml:"connectTimeout"`
+	// LockTimeout bounds how long a statement waits for a lock on the regular
+	// (non-replication) connections. Disabled by default; setting it makes the
+	// publication DDL fail fast instead of queueing behind a conflicting lock,
+	// which in PostgreSQL's FIFO lock queue also blocks every reader behind it.
+	LockTimeout      time.Duration    `json:"lockTimeout" yaml:"lockTimeout"`
+	DebugMode        bool             `json:"debugMode" yaml:"debugMode"`
+	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
 	// SkipTupleMapDecode skips building the Decoded/NewDecoded/OldDecoded map
 	// on Insert/Update/Delete messages (see format package). Off by default
 	// to preserve existing behavior; a consumer that resolves columns
@@ -60,22 +69,48 @@ type HeartbeatConfig struct {
 // DSN returns a normal PostgreSQL connection string for regular database operations
 // (publication, metadata, snapshot chunks, etc.)
 func (c *Config) DSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	params := url.Values{}
+	if c.LockTimeout > 0 {
+		ms := max(c.LockTimeout.Milliseconds(), 1)
+		params.Set("options", fmt.Sprintf("-c lock_timeout=%d", ms))
+	}
+	return c.dsn(params)
 }
 
 // ReplicationDSN returns a replication connection string for CDC streaming
 // This connection counts against max_wal_senders limit
 func (c *Config) ReplicationDSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	// lock_timeout is deliberately not set here: CREATE_REPLICATION_SLOT waits
+	// for a consistent point rather than for locks, and a walsender holds none.
+	params := url.Values{"replication": []string{"database"}}
+	return c.dsn(params)
 }
 
 func (c *Config) DSNWithoutSSL() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	params := url.Values{"sslmode": []string{"disable"}}
+	return c.dsn(params)
+}
+
+func (c *Config) dsn(params url.Values) string {
+	if c.ConnectTimeout > 0 {
+		seconds := max(int64(c.ConnectTimeout.Round(time.Second).Seconds()), 1)
+		params.Set("connect_timeout", strconv.FormatInt(seconds, 10))
+	}
+
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	if len(params) == 0 {
+		return dsn
+	}
+	return dsn + "?" + params.Encode()
 }
 
 func (c *Config) SetDefault() {
 	if c.Port == 0 {
 		c.Port = 5432
+	}
+
+	if c.ConnectTimeout == 0 {
+		c.ConnectTimeout = 10 * time.Second
 	}
 
 	if c.Metric.Port == 0 {
