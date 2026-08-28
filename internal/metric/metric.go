@@ -35,6 +35,12 @@ type Metric interface {
 	SetSnapshotCompletedChunks(completed int)
 	SetSnapshotActiveWorkers(workers int)
 
+	// In-process replication reconnect metrics
+	ReconnectAttemptIncrement()
+	ReconnectSuccessIncrement()
+	ReconnectFailureIncrement()
+	SetReconnecting(active bool)
+
 	PrometheusCollectors() []prometheus.Collector
 }
 
@@ -64,6 +70,12 @@ type metric struct {
 	snapshotTotalChunks     prometheus.Gauge
 	snapshotCompletedChunks prometheus.Gauge
 	snapshotActiveWorkers   prometheus.Gauge
+
+	// In-process replication reconnect metrics
+	reconnectAttempts  prometheus.Counter
+	reconnectSuccesses prometheus.Counter
+	reconnectFailures  prometheus.Counter
+	reconnecting       prometheus.Gauge
 }
 
 //nolint:funlen
@@ -270,6 +282,46 @@ func NewMetric(slotName string) Metric {
 				"host":      hostname,
 			},
 		}),
+		reconnectAttempts: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "reconnect",
+			Name:      "attempts_total",
+			Help:      "total number of in-process replication reconnect attempts",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		reconnectSuccesses: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "reconnect",
+			Name:      "success_total",
+			Help:      "total number of successful in-process replication reconnects",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		reconnectFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "reconnect",
+			Name:      "failure_total",
+			Help:      "total number of in-process replication reconnects that exhausted their budget",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		reconnecting: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "reconnect",
+			Name:      "in_progress",
+			Help:      "whether an in-process replication reconnect is currently in progress (1) or not (0)",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
 	}
 }
 
@@ -295,6 +347,10 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.snapshotTotalChunks,
 		m.snapshotCompletedChunks,
 		m.snapshotActiveWorkers,
+		m.reconnectAttempts,
+		m.reconnectSuccesses,
+		m.reconnectFailures,
+		m.reconnecting,
 	}
 }
 
@@ -379,4 +435,24 @@ func (m *metric) SetSnapshotCompletedChunks(completed int) {
 
 func (m *metric) SetSnapshotActiveWorkers(workers int) {
 	m.snapshotActiveWorkers.Set(float64(workers))
+}
+
+func (m *metric) ReconnectAttemptIncrement() {
+	m.reconnectAttempts.Inc()
+}
+
+func (m *metric) ReconnectSuccessIncrement() {
+	m.reconnectSuccesses.Inc()
+}
+
+func (m *metric) ReconnectFailureIncrement() {
+	m.reconnectFailures.Inc()
+}
+
+func (m *metric) SetReconnecting(active bool) {
+	value := 0.0
+	if active {
+		value = 1.0
+	}
+	m.reconnecting.Set(value)
 }
