@@ -178,6 +178,41 @@ func (s *stream) setup(ctx context.Context) error {
 	return nil
 }
 
+// resetForReconnect clears the in-memory state that must not survive an
+// in-process reconnect of the replication stream.
+//
+//   - txCommit describes the non-streamed transaction currently being
+//     decoded. A stale value here would silently stamp the next
+//     transaction's changes with the wrong commit context.
+//   - openFromSnapshotLSN only applies to the very first connect; leaving it
+//     set would make the reconnect replay from the snapshot LSN instead of
+//     resuming normally.
+//   - lastXLogPos is reset to 0 so setup()'s existing
+//     `replicationStartLsn := s.lastXLogPos` sends START_REPLICATION 0/0,
+//     telling PostgreSQL to resume from the slot's durable
+//     confirmed_flush_lsn. lastXLogPos is the highest position this process
+//     has *received*, which can be ahead of what was actually acked;
+//     reusing it as the start position would silently skip the un-acked
+//     window instead of redelivering it. confirmedXLogPos is left
+//     untouched -- it only affects standby status updates this process
+//     sends, never the start position.
+//
+// The messageBuffer and streamTxBuffer used by the sink loop are not reset
+// here: the reconnect loop constructs fresh instances per attempt instead,
+// which is trivially correct rather than relying on clearing every field of
+// reused ones.
+func (s *stream) resetForReconnect() {
+	s.txCommit.time = time.Time{}
+	s.txCommit.lsn = 0
+	s.txCommit.xid = 0
+
+	s.openFromSnapshotLSN = false
+
+	s.mu.Lock()
+	s.lastXLogPos = 0
+	s.mu.Unlock()
+}
+
 // messageBuffer manages a one-message look-ahead buffer.
 //
 // The last DML message in each transaction is held back so its WAL position
