@@ -17,8 +17,16 @@ type Config[T any] struct {
 	Options []retry.Option
 }
 
+// Do runs f under rc.Options. If rc.If is set, it is honored via
+// retry.RetryIf: f is retried only while If(err) reports true for the most
+// recent failure. If rc.If is nil, every error is retried (the retry-go
+// default when no RetryIf option is supplied).
 func (rc Config[T]) Do(f retry.RetryableFuncWithData[T]) (T, error) {
-	return retry.DoWithData(f, rc.Options...)
+	options := append([]retry.Option(nil), rc.Options...)
+	if rc.If != nil {
+		options = append(options, retry.RetryIf(rc.If))
+	}
+	return retry.DoWithData(f, options...)
 }
 
 func OnErrorConfig[T any](attemptCount uint, check func(error) bool) Config[T] {
