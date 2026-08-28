@@ -567,6 +567,75 @@ func TestSetDefaultProtoVersion(t *testing.T) {
 	})
 }
 
+func TestSetDefaultReconnectConfig(t *testing.T) {
+	t.Run("defaults are applied when unset", func(t *testing.T) {
+		cfg := &Config{}
+		cfg.SetDefault()
+		assert.False(t, cfg.Reconnect.Enabled, "Enabled must stay false unless explicitly set")
+		assert.Equal(t, 250*time.Millisecond, cfg.Reconnect.InitialDelay)
+		assert.Equal(t, 30*time.Second, cfg.Reconnect.MaxDelay)
+		assert.Equal(t, time.Second, cfg.Reconnect.MaxJitter)
+		assert.Equal(t, 5*time.Minute, cfg.Reconnect.MaxElapsed)
+		assert.Zero(t, cfg.Reconnect.MaxAttempts, "0 means unbounded by count")
+	})
+
+	t.Run("leaves explicit values untouched", func(t *testing.T) {
+		cfg := &Config{Reconnect: ReconnectConfig{
+			Enabled:      true,
+			InitialDelay: time.Millisecond,
+			MaxDelay:     time.Minute,
+			MaxJitter:    2 * time.Second,
+			MaxElapsed:   10 * time.Minute,
+			MaxAttempts:  7,
+		}}
+		cfg.SetDefault()
+		assert.True(t, cfg.Reconnect.Enabled)
+		assert.Equal(t, time.Millisecond, cfg.Reconnect.InitialDelay)
+		assert.Equal(t, time.Minute, cfg.Reconnect.MaxDelay)
+		assert.Equal(t, 2*time.Second, cfg.Reconnect.MaxJitter)
+		assert.Equal(t, 10*time.Minute, cfg.Reconnect.MaxElapsed)
+		assert.EqualValues(t, 7, cfg.Reconnect.MaxAttempts)
+	})
+}
+
+func TestReconnectConfigValidate(t *testing.T) {
+	t.Run("defaulted config is valid", func(t *testing.T) {
+		cfg := &Config{}
+		cfg.SetDefault()
+		assert.NoError(t, cfg.Reconnect.Validate())
+	})
+
+	t.Run("rejects negative durations", func(t *testing.T) {
+		tests := []struct {
+			name string
+			cfg  ReconnectConfig
+			want string
+		}{
+			{"initialDelay", ReconnectConfig{InitialDelay: -1}, "reconnect.initialDelay cannot be negative"},
+			{"maxDelay", ReconnectConfig{MaxDelay: -1}, "reconnect.maxDelay cannot be negative"},
+			{"maxJitter", ReconnectConfig{MaxJitter: -1}, "reconnect.maxJitter cannot be negative"},
+			{"maxElapsed", ReconnectConfig{MaxElapsed: -1}, "reconnect.maxElapsed cannot be negative"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				err := tt.cfg.Validate()
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.want)
+			})
+		}
+	})
+
+	t.Run("rejects maxDelay less than initialDelay", func(t *testing.T) {
+		err := ReconnectConfig{InitialDelay: time.Minute, MaxDelay: time.Second}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reconnect.maxDelay must be greater than or equal to reconnect.initialDelay")
+	})
+
+	t.Run("zero-value config is valid", func(t *testing.T) {
+		assert.NoError(t, ReconnectConfig{}.Validate())
+	})
+}
+
 func TestValidateHeartbeatInPublication(t *testing.T) {
 	validBase := func() Config {
 		return Config{
