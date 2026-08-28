@@ -366,6 +366,25 @@ reconnect:
   maxElapsed: 5m
 ```
 
+### Error Handling
+
+Most errors this library returns are wrapped in a [`go-playground/errors`](https://github.com/go-playground/errors) `Chain`, which does **not** implement `Unwrap() error`. Standard library `errors.Is`/`errors.As` cannot see through that wrapping to match a cause underneath it — a plain `errors.Is(err, someSentinel)` will silently return `false` even when `someSentinel` really is the cause.
+
+Two ways to check an error correctly:
+
+- **Use a provided classifier** where one exists, e.g. `cdc.IsRetryableStartupError(err)` for a `NewConnector` failure — it already unwraps internally.
+- **Unwrap it yourself** with the same library's own `Cause` helper before calling `errors.Is`/`errors.As`:
+
+  ```go
+  import pkgerrors "github.com/go-playground/errors"
+
+  if pkgerrors.Cause(err) == someSentinel {
+      // ...
+  }
+  ```
+
+A few sentinels are plain stdlib errors specifically so `errors.Is` works on them directly, with no unwrapping needed: `cdc.ErrConnectorConsumed`, `replication.ErrorSlotInUse`, and `replication.ErrorNotConnected`.
+
 ### Configuration
 
 | Variable                                |   Type   | Required | Default | Description                                                                                           | Options                                                                                                                                            |
