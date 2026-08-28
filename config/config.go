@@ -19,17 +19,17 @@ import (
 const defaultSchema = "public"
 
 type Config struct {
-	Logger           LoggerConfig       `json:"logger" yaml:"logger"`
-	Host             string             `json:"host" yaml:"host"`
-	Username         string             `json:"username" yaml:"username"`
-	Password         string             `json:"password" yaml:"password"`
-	Database         string             `json:"database" yaml:"database"`
-	Publication      publication.Config `json:"publication" yaml:"publication"`
-	Heartbeat        HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
-	Slot             slot.Config        `json:"slot" yaml:"slot"`
-	Snapshot         SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
-	Port             int                `json:"port" yaml:"port"`
-	Metric           MetricConfig       `json:"metric" yaml:"metric"`
+	Logger      LoggerConfig       `json:"logger" yaml:"logger"`
+	Host        string             `json:"host" yaml:"host"`
+	Username    string             `json:"username" yaml:"username"`
+	Password    string             `json:"password" yaml:"password"`
+	Database    string             `json:"database" yaml:"database"`
+	Publication publication.Config `json:"publication" yaml:"publication"`
+	Heartbeat   HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
+	Slot        slot.Config        `json:"slot" yaml:"slot"`
+	Snapshot    SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
+	Port        int                `json:"port" yaml:"port"`
+	Metric      MetricConfig       `json:"metric" yaml:"metric"`
 	// ConnectTimeout bounds establishing a connection. Without it a blackholed
 	// host is bounded only by the OS TCP timeout. Defaults to 10s.
 	ConnectTimeout time.Duration `json:"connectTimeout" yaml:"connectTimeout"`
@@ -46,10 +46,59 @@ type Config struct {
 	// directly from TupleData/NewTupleData/OldTupleData can enable it to
 	// avoid the extra allocation and decode pass this map costs per row.
 	SkipTupleMapDecode bool `json:"skipTupleMapDecode" yaml:"skipTupleMapDecode"`
+	// Reconnect governs in-process reconnection of the replication stream
+	// after an unrecoverable connection loss. See ReconnectConfig.
+	Reconnect ReconnectConfig `json:"reconnect" yaml:"reconnect"`
 }
 
 type MetricConfig struct {
 	Port int `json:"port" yaml:"port"`
+}
+
+// ReconnectConfig governs in-process reconnection of the replication stream
+// after an unrecoverable connection loss. Disabled by default: an unrecovered
+// disconnect panics, exactly as before this option existed. Enabling it
+// bounds retries by wall-clock elapsed time (MaxElapsed), not attempt count,
+// because a replication slot that is not advancing prevents PostgreSQL from
+// recycling WAL -- retrying forever is not a safe default here. Exhausting
+// the budget falls back to the same panic.
+type ReconnectConfig struct {
+	Enabled bool `json:"enabled" yaml:"enabled"`
+	// InitialDelay is the delay before the first reconnect attempt after a
+	// disconnect, and the base of the exponential backoff. Defaults to 250ms.
+	InitialDelay time.Duration `json:"initialDelay" yaml:"initialDelay"`
+	// MaxDelay caps the exponential backoff between attempts. Defaults to 30s.
+	MaxDelay time.Duration `json:"maxDelay" yaml:"maxDelay"`
+	// MaxJitter adds up to this much random delay to each attempt, so a fleet
+	// of connectors reconnecting to the same outage does not retry in
+	// lockstep. Defaults to 1s.
+	MaxJitter time.Duration `json:"maxJitter" yaml:"maxJitter"`
+	// MaxElapsed bounds the total wall-clock time spent reconnecting before
+	// giving up and panicking. Defaults to 5m.
+	MaxElapsed time.Duration `json:"maxElapsed" yaml:"maxElapsed"`
+	// MaxAttempts additionally bounds the number of attempts. 0 (default)
+	// means unbounded by count; MaxElapsed is the meaningful ceiling.
+	MaxAttempts uint `json:"maxAttempts" yaml:"maxAttempts"`
+}
+
+func (rc ReconnectConfig) Validate() error {
+	var err error
+	if rc.InitialDelay < 0 {
+		err = errors.Join(err, errors.New("reconnect.initialDelay cannot be negative"))
+	}
+	if rc.MaxDelay < 0 {
+		err = errors.Join(err, errors.New("reconnect.maxDelay cannot be negative"))
+	}
+	if rc.MaxJitter < 0 {
+		err = errors.Join(err, errors.New("reconnect.maxJitter cannot be negative"))
+	}
+	if rc.MaxElapsed < 0 {
+		err = errors.Join(err, errors.New("reconnect.maxElapsed cannot be negative"))
+	}
+	if rc.MaxDelay > 0 && rc.InitialDelay > 0 && rc.MaxDelay < rc.InitialDelay {
+		err = errors.Join(err, errors.New("reconnect.maxDelay must be greater than or equal to reconnect.initialDelay"))
+	}
+	return err
 }
 
 type LoggerConfig struct {
@@ -111,6 +160,22 @@ func (c *Config) SetDefault() {
 
 	if c.ConnectTimeout == 0 {
 		c.ConnectTimeout = 10 * time.Second
+	}
+
+	if c.Reconnect.InitialDelay == 0 {
+		c.Reconnect.InitialDelay = 250 * time.Millisecond
+	}
+
+	if c.Reconnect.MaxDelay == 0 {
+		c.Reconnect.MaxDelay = 30 * time.Second
+	}
+
+	if c.Reconnect.MaxJitter == 0 {
+		c.Reconnect.MaxJitter = time.Second
+	}
+
+	if c.Reconnect.MaxElapsed == 0 {
+		c.Reconnect.MaxElapsed = 5 * time.Minute
 	}
 
 	if c.Metric.Port == 0 {
@@ -314,6 +379,10 @@ func (c *Config) Validate() error {
 				err = errors.Join(err, hErr)
 			}
 		}
+	}
+
+	if rErr := c.Reconnect.Validate(); rErr != nil {
+		err = errors.Join(err, rErr)
 	}
 
 	return err
