@@ -123,6 +123,9 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 
 	tdb, err := initializeTimescaleDB(ctx, cfg)
 	if err != nil {
+		if snapshotter != nil {
+			snapshotter.Close(ctx)
+		}
 		return nil, err
 	}
 
@@ -644,7 +647,13 @@ func (c *connector) CaptureSlot(ctx context.Context) {
 	logger.Info("slot capturing...")
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
 		info, err := c.slot.Info(ctx)
 		if err != nil {
 			if goerrors.Is(err, slot.ErrorSlotClosed) {
