@@ -4,7 +4,6 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -478,9 +477,8 @@ func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
 		// Phase 3: Execute snapshot (collect data from all chunks)
 		// This may fail if coordinator restarts during execution - retry with backoff
 		if err := c.executeSnapshotWithRetry(ctx); err != nil {
-			// Non-recoverable error
 			if c.isSnapshotInvalidationError(err) {
-				log.Fatal(err)
+				logger.Error("snapshot invalidated and retries exhausted; giving up on this attempt", "error", err)
 			}
 			return errors.Wrap(err, "execute snapshot")
 		}
