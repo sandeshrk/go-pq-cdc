@@ -25,8 +25,14 @@ import (
 )
 
 var (
-	ErrorSlotInUse    = errors.New("replication slot in use")
-	ErrorNotConnected = errors.New("stream is not connected")
+	// ErrorSlotInUse and ErrorNotConnected are stdlib errors (not
+	// go-playground/errors.Chain) deliberately: Chain is a slice type
+	// ([]*Link), which Go's stdlib errors.Is/As treat as non-comparable and
+	// therefore never match -- even against the exact same value. These two
+	// are meant to be checked by callers via errors.Is, so they must stay
+	// plain stdlib errors.
+	ErrorSlotInUse    = goerrors.New("replication slot in use")
+	ErrorNotConnected = goerrors.New("stream is not connected")
 )
 
 const (
