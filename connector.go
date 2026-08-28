@@ -289,6 +289,13 @@ func (c *connector) Start(ctx context.Context) {
 	// Normal CDC flow (unchanged for backward compatibility)
 	c.CaptureSlot(ctx)
 
+	// CaptureSlot also returns when ctx is cancelled; stop rather than fail the
+	// remaining steps with a cancelled context.
+	if ctx.Err() != nil {
+		logger.Info("slot capture cancelled")
+		return
+	}
+
 	if err := c.stream.Connect(ctx); err != nil {
 		logger.Error("stream connection failed", "error", err)
 		return
