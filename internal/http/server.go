@@ -30,6 +30,9 @@ type server struct {
 	server           http.Server
 	cdcConfig        config.Config
 	closed           bool
+	// shutdownFunc defaults to s.server.Shutdown; overridable in tests to
+	// simulate a shutdown error without needing a real hung connection.
+	shutdownFunc func(ctx context.Context) error
 }
 
 func NewServer(cfg config.Config, registry metric.Registry, slotInfoProvider SlotInfoProvider) Server {
@@ -58,6 +61,7 @@ func NewServer(cfg config.Config, registry metric.Registry, slotInfoProvider Slo
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
+	s.shutdownFunc = s.server.Shutdown
 
 	return s
 }
@@ -80,10 +84,12 @@ func (s *server) Shutdown() {
 		return
 	}
 	s.closed = true
-	err := s.server.Shutdown(context.Background())
-	if err != nil {
+	shutdown := s.shutdownFunc
+	if shutdown == nil {
+		shutdown = s.server.Shutdown
+	}
+	if err := shutdown(context.Background()); err != nil {
 		logger.Error("error while api cannot be shutdown", "error", err)
-		panic(err)
 	}
 }
 
