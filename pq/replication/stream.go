@@ -354,10 +354,21 @@ func (s *streamTxBuffer) discardTx(xid uint32) {
 func (s *stream) sink(ctx context.Context) {
 	logger.Info("postgres message sink started")
 
-	buf := &messageBuffer{outCh: s.messageCH}
-	buf.ctx = ctx
-	streamBuf := &streamTxBuffer{ctx: ctx}
-	corrupted := s.sinkLoop(ctx, buf, streamBuf)
+	var corrupted bool
+	for {
+		buf := &messageBuffer{outCh: s.messageCH, ctx: ctx}
+		streamBuf := &streamTxBuffer{ctx: ctx}
+		corrupted = s.sinkLoop(ctx, buf, streamBuf)
+
+		if !corrupted || s.closed.Load() || !s.config.Reconnect.Enabled {
+			break
+		}
+		if !s.reconnect(ctx) {
+			break
+		}
+		logger.Info("replication stream reconnected, resuming sink loop")
+	}
+
 	s.messageCloseOnce.Do(func() {
 		close(s.messageCH)
 	})
@@ -376,6 +387,85 @@ func (s *stream) sink(ctx context.Context) {
 			panic("corrupted connection")
 		}
 	}
+}
+
+// reconnect attempts to reopen the replication connection after sinkLoop
+// reports a corrupted connection, following s.config.Reconnect's backoff and
+// budget (wall-clock MaxElapsed, additionally bounded by MaxAttempts if set).
+// It reports whether the connection was successfully reopened; the caller
+// falls through to the existing panic when it returns false, exactly as if
+// reconnecting were never attempted. Only called when Reconnect.Enabled.
+func (s *stream) reconnect(ctx context.Context) bool {
+	cfg := s.config.Reconnect
+	start := time.Now()
+
+	s.metric.SetReconnecting(true)
+	defer s.metric.SetReconnecting(false)
+
+	// retry-go's RandomDelay (part of its default DelayType) calls
+	// rand.Int63n(maxJitter) unconditionally and panics if maxJitter is 0.
+	// MaxJitter: 0 is a valid, deliberate config choice (no jitter), so fall
+	// back to plain exponential backoff instead of feeding it to RandomDelay.
+	delayType := retry.BackOffDelay
+	if cfg.MaxJitter > 0 {
+		delayType = retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)
+	}
+
+	options := []retry.Option{
+		retry.Context(ctx),
+		retry.Attempts(cfg.MaxAttempts), // 0 == unbounded by count, matches retry-go's own convention
+		retry.Delay(cfg.InitialDelay),
+		retry.MaxDelay(cfg.MaxDelay),
+		retry.MaxJitter(cfg.MaxJitter),
+		retry.DelayType(delayType),
+		retry.LastErrorOnly(true),
+		// MaxElapsed is the meaningful ceiling: a replication slot that is
+		// not advancing prevents PostgreSQL from recycling WAL, so retrying
+		// forever is not safe here even though MaxAttempts may be 0.
+		retry.RetryIf(func(error) bool {
+			return time.Since(start) < cfg.MaxElapsed
+		}),
+		retry.OnRetry(func(n uint, err error) {
+			logger.Warn("replication stream reconnect attempt failed",
+				"attempt", n+1, "elapsed", time.Since(start).String(), "error", err)
+		}),
+	}
+
+	err := retry.Do(func() error {
+		s.metric.ReconnectAttemptIncrement()
+
+		if s.closed.Load() {
+			return retry.Unrecoverable(goerrors.New("stream closed"))
+		}
+
+		s.resetForReconnect()
+
+		// setup() talks to s.conn's frontend directly (START_REPLICATION,
+		// then the handshake read in replication.Test), same as Connect just
+		// did. Unlike the very first setup() call from Open (before sink/
+		// process exist), this one runs from the live sink goroutine while
+		// Close() can be called concurrently by the application at any time
+		// -- so the lock must cover setup() too, not just Close+Connect.
+		s.connMu.Lock()
+		defer s.connMu.Unlock()
+
+		_ = s.conn.Close(ctx)
+		if err := s.conn.Connect(ctx); err != nil {
+			return err
+		}
+
+		return s.setup(ctx)
+	}, options...)
+
+	if err != nil {
+		logger.Error("giving up on in-process reconnect", "elapsed", time.Since(start).String(), "error", err)
+		s.metric.ReconnectFailureIncrement()
+		return false
+	}
+
+	logger.Info("replication stream reconnected", "elapsed", time.Since(start).String())
+	s.metric.ReconnectSuccessIncrement()
+	return true
 }
 
 // sinkLoop reads raw replication messages and dispatches them until the

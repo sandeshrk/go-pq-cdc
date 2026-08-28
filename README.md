@@ -351,6 +351,21 @@ You can run [Replica Identity Using Index](./example/replica-identity-using-inde
 
 You can run [Replica Identity Nothing](./example/replica-identity-nothing) for an insert-only `NOTHING` example.
 
+### Reconnect
+
+By default, an unexpected replication connection loss (network blip, PostgreSQL restart, `pg_terminate_backend`, etc.) panics the process. This is deliberate: a replication slot that stops advancing prevents PostgreSQL from recycling WAL, so a silent, unbounded retry loop is not a safe default.
+
+Setting `reconnect.enabled: true` makes the connector try to reopen the replication stream in-process first, following an exponential backoff (`reconnect.initialDelay`, capped at `reconnect.maxDelay`, with `reconnect.maxJitter` added to avoid a reconnect storm across a fleet). If the connection comes back before `reconnect.maxElapsed` (and `reconnect.maxAttempts`, if set) is exhausted, the stream resumes from the slot's last confirmed position exactly as it would on a fresh restart — no messages are lost, though any unacknowledged transaction is redelivered. If the budget runs out, the process still falls back to the same panic as today.
+
+```yaml
+reconnect:
+  enabled: true
+  initialDelay: 250ms
+  maxDelay: 30s
+  maxJitter: 1s
+  maxElapsed: 5m
+```
+
 ### Configuration
 
 | Variable                                |   Type   | Required | Default | Description                                                                                           | Options                                                                                                                                            |
@@ -362,6 +377,12 @@ You can run [Replica Identity Nothing](./example/replica-identity-nothing) for a
 | `debugMode`                             |   bool   |    no    |  false  | For debugging purposes                                                                                | Enables pprof for trace.                                                                                                                           |
 | `connectTimeout`                        | Duration |    no    |   10s   | Bounds establishing a PostgreSQL connection (`connect_timeout` on every DSN).                          | Without it a blackholed host is bounded only by the OS TCP timeout, which can stall startup for minutes. Set `0` to fall back to that behavior.     |
 | `lockTimeout`                           | Duration |    no    |    -    | Bounds how long a statement waits for a lock on the regular (non-replication) connections.             | Disabled by default. When set, `ALTER TABLE ... REPLICA IDENTITY` and publication DDL fail fast (SQLSTATE `55P03`) instead of queueing behind a conflicting lock, which in PostgreSQL's FIFO lock queue also blocks every reader behind it. Retry with `cdc.IsRetryableStartupError`. |
+| `reconnect.enabled`                     |   bool   |    no    |  false  | Attempt an in-process reconnect of the replication stream after an unexpected disconnect, instead of panicking immediately. | Disabled by default: an unrecovered disconnect panics, exactly as before this option existed. See [Reconnect](#reconnect) below. |
+| `reconnect.initialDelay`                | Duration |    no    |  250ms  | Delay before the first reconnect attempt, and the base of the exponential backoff.                    |                                                                                                                                                    |
+| `reconnect.maxDelay`                    | Duration |    no    |   30s   | Caps the exponential backoff between attempts.                                                        | Must be greater than or equal to `reconnect.initialDelay`.                                                                                          |
+| `reconnect.maxJitter`                   | Duration |    no    |    1s   | Adds up to this much random delay to each attempt.                                                    | So a fleet of connectors reconnecting to the same outage does not retry in lockstep. `0` disables jitter.                                          |
+| `reconnect.maxElapsed`                  | Duration |    no    |   5m    | Bounds the total wall-clock time spent reconnecting before giving up and panicking.                    | The meaningful ceiling: a replication slot that is not advancing prevents PostgreSQL from recycling WAL, so retrying forever is not a safe default. |
+| `reconnect.maxAttempts`                 |   uint   |    no    |    0    | Additionally bounds the number of attempts.                                                            | `0` (default) means unbounded by count; `reconnect.maxElapsed` is the meaningful ceiling.                                                          |
 | `metric.port`                           |   int    |    no    |  8080   | Set API port                                                                                          | Choose a port that is not in use by other applications.                                                                                            |
 | `logger.logLevel`                       |  string  |    no    |  info   | Set logging level                                                                                     | [`DEBUG`, `WARN`, `INFO`, `ERROR`]                                                                                                                 |
 | `logger.logger`                         |  Logger  |    no    |  slog   | Set logger                                                                                            | Can be customized with other logging frameworks if `slog` is not used.                                                                             |
