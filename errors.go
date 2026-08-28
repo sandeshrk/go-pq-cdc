@@ -35,11 +35,12 @@ func IsRetryableStartupError(err error) bool {
 		return true
 	}
 
-	var connErr *pgconn.ConnectError
-	if goerrors.As(cause, &connErr) {
-		return true
-	}
-
+	// Check for a specific Postgres error code first, even when it arrives
+	// wrapped inside a *pgconn.ConnectError -- pgx wraps EVERY startup
+	// handshake failure in ConnectError, including permanent rejections like
+	// wrong credentials (28P01) or insufficient privilege (42501), not just
+	// transient network blips. Checking ConnectError before PgError (as this
+	// used to) treats those permanent failures as retryable too.
 	var pgErr *pgconn.PgError
 	if goerrors.As(cause, &pgErr) {
 		switch pgErr.Code {
@@ -57,6 +58,11 @@ func IsRetryableStartupError(err error) bool {
 			return true
 		}
 		return false
+	}
+
+	var connErr *pgconn.ConnectError
+	if goerrors.As(cause, &connErr) {
+		return true
 	}
 
 	if goerrors.Is(cause, publication.ErrorTablesNotExists) {
