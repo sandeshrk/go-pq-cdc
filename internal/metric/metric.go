@@ -23,6 +23,10 @@ type Metric interface {
 	SetSlotConfirmedFlushLSN(lsn float64)
 	SetSlotRetainedWALSize(lsn float64)
 	SetSlotLag(lsn float64)
+	// SetUnackedLSNLag reports the gap between the highest WAL position this
+	// process has received and the highest position the consumer has acked.
+	// A stalled listener grows this gauge even while slot_lag looks small.
+	SetUnackedLSNLag(lsn float64)
 
 	SetSnapshotInProgress(inProgress bool)
 	SetSnapshotTotalTables(total int)
@@ -58,6 +62,7 @@ type metric struct {
 	slotCurrentLSN             prometheus.Gauge
 	slotRetainedWALSize        prometheus.Gauge
 	slotLag                    prometheus.Gauge
+	unackedLSNLag              prometheus.Gauge
 
 	// Snapshot metrics
 	snapshotInProgress      prometheus.Gauge
@@ -202,6 +207,16 @@ func NewMetric(slotName string) Metric {
 				"host":      hostname,
 			},
 		}),
+		unackedLSNLag: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "stream",
+			Name:      "unacked_lsn_lag",
+			Help:      "highest wal position received by this process minus the highest position acked by the consumer",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
 		snapshotInProgress: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
 			Subsystem: "snapshot",
@@ -339,6 +354,7 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.slotConfirmedFlushLSN,
 		m.slotRetainedWALSize,
 		m.slotLag,
+		m.unackedLSNLag,
 		m.snapshotInProgress,
 		m.snapshotTotalTables,
 		m.snapshotCompletedTables,
@@ -399,6 +415,10 @@ func (m *metric) SetSlotRetainedWALSize(lsn float64) {
 
 func (m *metric) SetSlotLag(lsn float64) {
 	m.slotLag.Set(float64(lsn))
+}
+
+func (m *metric) SetUnackedLSNLag(lsn float64) {
+	m.unackedLSNLag.Set(lsn)
 }
 
 func (m *metric) SetSnapshotInProgress(inProgress bool) {

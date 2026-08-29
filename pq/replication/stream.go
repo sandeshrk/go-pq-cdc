@@ -149,10 +149,40 @@ func (s *stream) Open(ctx context.Context) error {
 
 	go s.sink(runCtx)
 	go s.process(runCtx)
+	if s.config.LSNFlushInterval > 0 {
+		go s.flushTicker(runCtx)
+	}
 
 	logger.Info("cdc stream started")
 
 	return nil
+}
+
+// flushTicker periodically sends a standby status update, independent of the
+// sink's read-idle timeout and PostgreSQL's own keepalive replies. Under
+// sustained throughput (especially with wal_sender_timeout disabled) neither
+// of those triggers fires reliably, so confirmed_flush_lsn can stall while
+// WAL keeps accumulating. Survives in-process reconnects: s.conn is replaced
+// in place, and sendStandbyStatusUpdate always reads the current field.
+func (s *stream) flushTicker(ctx context.Context) {
+	ticker := time.NewTicker(s.config.LSNFlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.LoadXLogPos() == 0 {
+				continue
+			}
+			if err := s.sendStandbyStatusUpdate(ctx); err != nil {
+				logger.Debug("periodic standby status update failed", "error", err)
+				continue
+			}
+			s.updateUnackedLagMetric()
+		}
+	}
 }
 
 func (s *stream) setup(ctx context.Context) error {
@@ -728,13 +758,13 @@ func (s *stream) process(ctx context.Context) {
 
 			// Ack only advances the confirmed position in memory; the standby
 			// status update is flushed to Postgres by the sink loop (idle-timeout
-			// and keepalive-reply paths). Sending it here per message serializes
-			// every ack behind the sink's connMu-held read, collapsing throughput
-			// to a few messages/sec while a buffered transaction is drained.
-			// ponytail: coalesced via sink idle/keepalive flush; add a periodic
-			// in-sink flush if retention lag under sustained no-gap load matters.
+			// and keepalive-reply paths) or by flushTicker (config.LSNFlushInterval).
+			// Sending it here per message serializes every ack behind the sink's
+			// connMu-held read, collapsing throughput to a few messages/sec while
+			// a buffered transaction is drained.
 			ackFunc := func() error {
 				s.UpdateConfirmedXLogPos(pq.LSN(msg.walStart))
+				s.updateUnackedLagMetric()
 				return nil
 			}
 
@@ -919,6 +949,20 @@ func (s *stream) LoadConfirmedXLogPos() pq.LSN {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.confirmedXLogPos
+}
+
+// updateUnackedLagMetric reports how far the highest received WAL position is
+// ahead of the highest position the consumer has acked. Unlike slot_lag (a
+// server-reported gauge refreshed on a polling interval), this is computed
+// from this process's own in-memory state and distinguishes "the consumer is
+// behind" from "we simply haven't flushed yet".
+func (s *stream) updateUnackedLagMetric() {
+	received, confirmed := s.LoadXLogPos(), s.LoadConfirmedXLogPos()
+	lag := float64(0)
+	if received > confirmed {
+		lag = float64(received - confirmed)
+	}
+	s.metric.SetUnackedLSNLag(lag)
 }
 
 func (s *stream) OpenFromSnapshotLSN() {
