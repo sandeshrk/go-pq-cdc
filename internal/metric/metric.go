@@ -27,6 +27,9 @@ type Metric interface {
 	// process has received and the highest position the consumer has acked.
 	// A stalled listener grows this gauge even while slot_lag looks small.
 	SetUnackedLSNLag(lsn float64)
+	// WALBacklogWarningIncrement counts every time flushTicker observes WAL
+	// received but nothing acked for several consecutive flush intervals.
+	WALBacklogWarningIncrement()
 
 	SetSnapshotInProgress(inProgress bool)
 	SetSnapshotTotalTables(total int)
@@ -63,6 +66,7 @@ type metric struct {
 	slotRetainedWALSize        prometheus.Gauge
 	slotLag                    prometheus.Gauge
 	unackedLSNLag              prometheus.Gauge
+	walBacklogWarnings         prometheus.Counter
 
 	// Snapshot metrics
 	snapshotInProgress      prometheus.Gauge
@@ -217,6 +221,16 @@ func NewMetric(slotName string) Metric {
 				"host":      hostname,
 			},
 		}),
+		walBacklogWarnings: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "stream",
+			Name:      "wal_backlog_warning_total",
+			Help:      "total number of times WAL was received but nothing had been acked for several consecutive flush intervals",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
 		snapshotInProgress: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
 			Subsystem: "snapshot",
@@ -355,6 +369,7 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.slotRetainedWALSize,
 		m.slotLag,
 		m.unackedLSNLag,
+		m.walBacklogWarnings,
 		m.snapshotInProgress,
 		m.snapshotTotalTables,
 		m.snapshotCompletedTables,
@@ -419,6 +434,10 @@ func (m *metric) SetSlotLag(lsn float64) {
 
 func (m *metric) SetUnackedLSNLag(lsn float64) {
 	m.unackedLSNLag.Set(lsn)
+}
+
+func (m *metric) WALBacklogWarningIncrement() {
+	m.walBacklogWarnings.Inc()
 }
 
 func (m *metric) SetSnapshotInProgress(inProgress bool) {

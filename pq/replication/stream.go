@@ -162,23 +162,41 @@ func (s *stream) Open(ctx context.Context) error {
 	return nil
 }
 
+// walBacklogWarnStallTicks is how many consecutive flush ticks must pass
+// with WAL received but confirmedXLogPos making no forward progress before
+// flushTicker warns. At the default 5s LSNFlushInterval that's ~50s -- long
+// enough to not fire on ordinary processing latency, short enough to catch
+// a genuinely stuck consumer or an idle-but-unheartbeated publication before
+// WAL retention becomes an incident. It re-warns every walBacklogWarnStallTicks
+// ticks thereafter rather than only once, so the condition isn't reported and
+// then forgotten.
+const walBacklogWarnStallTicks = 10
+
 // flushTicker periodically sends a standby status update, independent of the
 // sink's read-idle timeout and PostgreSQL's own keepalive replies. Under
 // sustained throughput (especially with wal_sender_timeout disabled) neither
 // of those triggers fires reliably, so confirmed_flush_lsn can stall while
 // WAL keeps accumulating. Survives in-process reconnects: s.conn is replaced
 // in place, and sendStandbyStatusUpdate always reads the current field.
+//
+// It also watches for a stalled consumer: WAL keeps arriving but nothing is
+// being acked, which prevents the slot from ever advancing (see
+// walBacklogWarnStallTicks).
 func (s *stream) flushTicker(ctx context.Context) {
 	ticker := time.NewTicker(s.config.LSNFlushInterval)
 	defer ticker.Stop()
 	defer func() { s.flushTickerEnd <- struct{}{} }()
+
+	var lastConfirmed pq.LSN
+	var stalledTicks int
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.LoadXLogPos() == 0 {
+			received := s.LoadXLogPos()
+			if received == 0 {
 				continue
 			}
 			if err := s.sendStandbyStatusUpdate(ctx); err != nil {
@@ -186,6 +204,21 @@ func (s *stream) flushTicker(ctx context.Context) {
 				continue
 			}
 			s.updateUnackedLagMetric()
+
+			confirmed := s.LoadConfirmedXLogPos()
+			if confirmed >= received || confirmed != lastConfirmed {
+				stalledTicks = 0
+				lastConfirmed = confirmed
+				continue
+			}
+			stalledTicks++
+			if stalledTicks%walBacklogWarnStallTicks == 0 {
+				logger.Warn("WAL received but nothing acked for a while; the replication slot cannot advance and WAL will accumulate -- "+
+					"if the captured tables are idle while the database is busy, enable heartbeat (config.Heartbeat) so the slot has something to confirm",
+					"receivedLSN", received.String(), "confirmedLSN", confirmed.String(),
+					"stalledFor", (time.Duration(stalledTicks) * s.config.LSNFlushInterval).String())
+				s.metric.WALBacklogWarningIncrement()
+			}
 		}
 	}
 }
