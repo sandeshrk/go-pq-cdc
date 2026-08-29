@@ -31,6 +31,18 @@ func TestReconnectMetrics(t *testing.T) {
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.reconnectFailures))
 }
 
+func TestUnackedLSNLagMetric(t *testing.T) {
+	m := NewMetric("test_slot").(*metric)
+
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.unackedLSNLag))
+
+	m.SetUnackedLSNLag(42)
+	assert.Equal(t, float64(42), testutil.ToFloat64(m.unackedLSNLag))
+
+	m.SetUnackedLSNLag(0)
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.unackedLSNLag))
+}
+
 func TestReconnectMetricsRegisteredAsCollectors(t *testing.T) {
 	m := NewMetric("test_slot").(*metric)
 	collectors := m.PrometheusCollectors()

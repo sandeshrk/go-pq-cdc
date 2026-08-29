@@ -598,6 +598,26 @@ func TestSetDefaultReconnectConfig(t *testing.T) {
 	})
 }
 
+func TestSetDefaultLSNFlushInterval(t *testing.T) {
+	t.Run("defaults to 5s when unset", func(t *testing.T) {
+		cfg := &Config{}
+		cfg.SetDefault()
+		assert.Equal(t, 5*time.Second, cfg.LSNFlushInterval)
+	})
+
+	t.Run("leaves an explicit value untouched", func(t *testing.T) {
+		cfg := &Config{LSNFlushInterval: time.Second}
+		cfg.SetDefault()
+		assert.Equal(t, time.Second, cfg.LSNFlushInterval)
+	})
+
+	t.Run("leaves a negative disable value untouched", func(t *testing.T) {
+		cfg := &Config{LSNFlushInterval: -1}
+		cfg.SetDefault()
+		assert.Equal(t, time.Duration(-1), cfg.LSNFlushInterval)
+	})
+}
+
 func TestReconnectConfigValidate(t *testing.T) {
 	t.Run("defaulted config is valid", func(t *testing.T) {
 		cfg := &Config{}

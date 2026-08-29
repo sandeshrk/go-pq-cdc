@@ -40,6 +40,15 @@ type Config struct {
 	LockTimeout      time.Duration    `json:"lockTimeout" yaml:"lockTimeout"`
 	DebugMode        bool             `json:"debugMode" yaml:"debugMode"`
 	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
+	// LSNFlushInterval periodically sends a standby status update on the
+	// replication connection, independent of the sink's read-idle timeout and
+	// PostgreSQL's own keepalive replies. Without it, confirmed_flush_lsn only
+	// advances when the read loop goes idle or a keepalive requests a reply --
+	// under sustained throughput (especially with wal_sender_timeout disabled)
+	// neither may happen, so WAL is retained indefinitely. Defaults to 5s. Set
+	// to a negative value to disable; 0 falls back to the default, matching
+	// this package's other Duration options.
+	LSNFlushInterval time.Duration `json:"lsnFlushInterval" yaml:"lsnFlushInterval"`
 	// SkipTupleMapDecode skips building the Decoded/NewDecoded/OldDecoded map
 	// on Insert/Update/Delete messages (see format package). Off by default
 	// to preserve existing behavior; a consumer that resolves columns
@@ -160,6 +169,10 @@ func (c *Config) SetDefault() {
 
 	if c.ConnectTimeout == 0 {
 		c.ConnectTimeout = 10 * time.Second
+	}
+
+	if c.LSNFlushInterval == 0 {
+		c.LSNFlushInterval = 5 * time.Second
 	}
 
 	if c.Reconnect.InitialDelay == 0 {
