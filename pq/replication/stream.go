@@ -74,6 +74,7 @@ type stream struct {
 	listenerFunc        ListenerFunc
 	sinkEnd             chan struct{}
 	processEnd          chan struct{}
+	flushTickerEnd      chan struct{}
 	mu                  *sync.RWMutex
 	config              config.Config
 	lastXLogPos         pq.LSN
@@ -84,6 +85,7 @@ type stream struct {
 	closed              atomic.Bool
 	sinkStarted         atomic.Bool
 	processStarted      atomic.Bool
+	flushTickerStarted  atomic.Bool
 	openFromSnapshotLSN bool
 	// txCommit holds the commit context of the non-streamed transaction
 	// currently being decoded, so each of its change messages can be stamped
@@ -106,10 +108,11 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 		// lastXLogPos:0 is not magical, 0 means, create replication starts with confirmed_flush_lsn
 		// https://github.com/postgres/postgres/blob/master/src/include/access/xlogdefs.h#L28
 		// https://github.com/postgres/postgres/blob/master/src/backend/replication/logical/logical.c#L540
-		lastXLogPos: 0,
-		sinkEnd:     make(chan struct{}, 1),
-		processEnd:  make(chan struct{}, 1),
-		mu:          &sync.RWMutex{},
+		lastXLogPos:    0,
+		sinkEnd:        make(chan struct{}, 1),
+		processEnd:     make(chan struct{}, 1),
+		flushTickerEnd: make(chan struct{}, 1),
+		mu:             &sync.RWMutex{},
 	}
 }
 
@@ -150,6 +153,7 @@ func (s *stream) Open(ctx context.Context) error {
 	go s.sink(runCtx)
 	go s.process(runCtx)
 	if s.config.LSNFlushInterval > 0 {
+		s.flushTickerStarted.Store(true)
 		go s.flushTicker(runCtx)
 	}
 
@@ -167,6 +171,7 @@ func (s *stream) Open(ctx context.Context) error {
 func (s *stream) flushTicker(ctx context.Context) {
 	ticker := time.NewTicker(s.config.LSNFlushInterval)
 	defer ticker.Stop()
+	defer func() { s.flushTickerEnd <- struct{}{} }()
 
 	for {
 		select {
@@ -862,6 +867,16 @@ func (s *stream) Close(ctx context.Context) error {
 		case <-ctx.Done():
 			logger.Warn("timed out waiting for postgres message process", "error", ctx.Err())
 			errs = append(errs, errors.Wrap(ctx.Err(), "wait for postgres message process"))
+		}
+	}
+
+	if s.flushTickerStarted.Load() {
+		select {
+		case <-s.flushTickerEnd:
+			logger.Info("postgres flush ticker stopped")
+		case <-ctx.Done():
+			logger.Warn("timed out waiting for postgres flush ticker", "error", ctx.Err())
+			errs = append(errs, errors.Wrap(ctx.Err(), "wait for postgres flush ticker"))
 		}
 	}
 
