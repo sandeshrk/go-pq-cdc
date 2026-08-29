@@ -39,6 +39,28 @@ func (m *lagCapturingMetric) LastLag() float64 {
 	return m.lastLag
 }
 
+// warningCapturingMetric wraps a real metric.Metric and counts calls to
+// WALBacklogWarningIncrement, guarded by a mutex (set from flushTicker's
+// goroutine, read from the test goroutine).
+type warningCapturingMetric struct {
+	metric.Metric
+	mu    sync.Mutex
+	count int
+}
+
+func (m *warningCapturingMetric) WALBacklogWarningIncrement() {
+	m.mu.Lock()
+	m.count++
+	m.mu.Unlock()
+	m.Metric.WALBacklogWarningIncrement()
+}
+
+func (m *warningCapturingMetric) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.count
+}
+
 // syncBuffer is a bytes.Buffer safe for one writer goroutine and one reader
 // goroutine, which is all these tests need (pgproto3.Frontend writes to it
 // off the test goroutine that polls its contents).
@@ -215,5 +237,72 @@ func TestAckUpdatesUnackedLagMetric(t *testing.T) {
 			t.Fatalf("lag metric was not updated to 400 after ack, last value %v", lm.LastLag())
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+// TestFlushTickerWarnsOnStalledBacklog verifies the warning counter fires
+// once received keeps arriving but confirmedXLogPos makes no forward
+// progress for walBacklogWarnStallTicks consecutive flush intervals.
+func TestFlushTickerWarnsOnStalledBacklog(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+
+	wm := &warningCapturingMetric{Metric: metric.NewMetric("test_slot")}
+	conn := &standbyCaptureConn{fe: pgproto3.NewFrontend(strings.NewReader(""), &syncBuffer{})}
+
+	s := NewStream("", config.Config{LSNFlushInterval: 2 * time.Millisecond}, wm, func(*ListenerContext) {}).(*stream)
+	s.conn = conn
+	s.UpdateXLogPos(500) // received > confirmed (0) and never acked in this test
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.flushTicker(ctx)
+	}()
+
+	deadline := time.After(500 * time.Millisecond)
+	for wm.Count() == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("expected the backlog warning counter to increment while confirmed made no progress")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	<-done
+}
+
+// TestFlushTickerDoesNotWarnWhenCaughtUp verifies the warning never fires
+// when the consumer keeps confirmedXLogPos equal to the received position --
+// there is no outstanding backlog to warn about.
+func TestFlushTickerDoesNotWarnWhenCaughtUp(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+
+	wm := &warningCapturingMetric{Metric: metric.NewMetric("test_slot")}
+	conn := &standbyCaptureConn{fe: pgproto3.NewFrontend(strings.NewReader(""), &syncBuffer{})}
+
+	s := NewStream("", config.Config{LSNFlushInterval: 2 * time.Millisecond}, wm, func(*ListenerContext) {}).(*stream)
+	s.conn = conn
+	s.UpdateXLogPos(500)
+	s.UpdateConfirmedXLogPos(500)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.flushTicker(ctx)
+	}()
+
+	// Long enough to cover many multiples of walBacklogWarnStallTicks at
+	// this interval, so a false positive would very likely have fired.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	if got := wm.Count(); got != 0 {
+		t.Fatalf("expected no backlog warning while fully caught up, got %d", got)
 	}
 }

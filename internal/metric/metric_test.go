@@ -43,6 +43,16 @@ func TestUnackedLSNLagMetric(t *testing.T) {
 	assert.Equal(t, float64(0), testutil.ToFloat64(m.unackedLSNLag))
 }
 
+func TestWALBacklogWarningMetric(t *testing.T) {
+	m := NewMetric("test_slot").(*metric)
+
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.walBacklogWarnings))
+
+	m.WALBacklogWarningIncrement()
+	m.WALBacklogWarningIncrement()
+	assert.Equal(t, float64(2), testutil.ToFloat64(m.walBacklogWarnings))
+}
+
 func TestReconnectMetricsRegisteredAsCollectors(t *testing.T) {
 	m := NewMetric("test_slot").(*metric)
 	collectors := m.PrometheusCollectors()
