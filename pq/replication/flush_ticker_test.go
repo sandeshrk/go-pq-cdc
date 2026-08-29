@@ -137,6 +137,38 @@ func TestFlushTickerSkipsWhenNothingReceivedYet(t *testing.T) {
 	}
 }
 
+// TestStreamCloseWaitsForFlushTicker verifies Close() blocks until flushTicker
+// has actually exited, mirroring how it already waits for sink/process via
+// sinkEnd/processEnd -- without this, Close() could return while flushTicker
+// is still running, an asymmetry a goroutine-leak check could catch.
+func TestStreamCloseWaitsForFlushTicker(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+
+	conn := &standbyCaptureConn{fe: pgproto3.NewFrontend(strings.NewReader(""), &syncBuffer{})}
+	s := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	s.conn = conn
+
+	// Isolate flushTicker's own completion tracking: sink/process are left
+	// unstarted so Close()'s only wait is the one this test exercises.
+	_, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.flushTickerStarted.Store(true)
+
+	const delay = 100 * time.Millisecond
+	go func() {
+		time.Sleep(delay)
+		s.flushTickerEnd <- struct{}{}
+	}()
+
+	start := time.Now()
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Fatalf("Close returned after %v, before flushTicker's simulated exit at %v -- Close is not waiting for flushTicker", elapsed, delay)
+	}
+}
+
 // TestUpdateUnackedLagMetric verifies the gap between the highest received
 // and highest acked WAL position is reported, and drops back to zero once
 // the consumer catches up.
