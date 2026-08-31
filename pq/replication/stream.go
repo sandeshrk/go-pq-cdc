@@ -496,8 +496,15 @@ func (s *stream) reconnect(ctx context.Context) bool {
 		// MaxElapsed is the meaningful ceiling: a replication slot that is
 		// not advancing prevents PostgreSQL from recycling WAL, so retrying
 		// forever is not safe here even though MaxAttempts may be 0.
-		retry.RetryIf(func(error) bool {
-			return time.Since(start) < cfg.MaxElapsed
+		//
+		// A permanent failure (bad credentials after a rotation, dropped
+		// database, insufficient privilege, ...) is classified the same way
+		// as a startup failure (see pq.IsRetryableConnectionError, shared
+		// with cdc.IsRetryableStartupError) and stops retrying immediately
+		// instead of burning the whole MaxElapsed budget on an attempt that
+		// cannot succeed.
+		retry.RetryIf(func(err error) bool {
+			return time.Since(start) < cfg.MaxElapsed && pq.IsRetryableConnectionError(errors.Cause(err))
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			logger.Warn("replication stream reconnect attempt failed",
@@ -532,7 +539,11 @@ func (s *stream) reconnect(ctx context.Context) bool {
 	}, options...)
 
 	if err != nil {
-		logger.Error("giving up on in-process reconnect", "elapsed", time.Since(start).String(), "error", err)
+		if !pq.IsRetryableConnectionError(errors.Cause(err)) {
+			logger.Error("giving up on in-process reconnect: permanent error, not retrying", "elapsed", time.Since(start).String(), "error", err)
+		} else {
+			logger.Error("giving up on in-process reconnect", "elapsed", time.Since(start).String(), "error", err)
+		}
 		s.metric.ReconnectFailureIncrement()
 		return false
 	}
