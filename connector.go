@@ -35,9 +35,16 @@ type Connector interface {
 	Start(ctx context.Context)
 	// Run blocks until shutdown, returning nil on a clean signal-driven or
 	// caller-context-cancelled shutdown, or the fatal error that stopped the
-	// pipeline (a bootstrap failure, or a recovered panic from one of the
-	// connector's background goroutines). Start is a thin wrapper around Run
-	// that discards the error, for backward compatibility.
+	// pipeline: a bootstrap failure, a recovered panic from one of the
+	// connector's background goroutines, or an unrecoverable replication
+	// stream connection loss (Reconnect disabled or its budget exhausted).
+	// Start is a thin wrapper around Run that discards the error, for
+	// backward compatibility -- note that unlike earlier versions, a fatal
+	// stream error no longer crashes the process; a Start(ctx) caller that
+	// discards Run's error will see Start return with streaming stopped
+	// but the process still running. Callers that need the crash-and-
+	// get-restarted-by-a-supervisor behavior, or automatic recovery,
+	// should call Run directly or use Supervise.
 	//
 	// A connector is one-shot: once Run/Start returns for any reason, a
 	// second call returns ErrConnectorConsumed immediately. Build a new
@@ -374,11 +381,28 @@ func (c *connector) run(ctx context.Context) error {
 
 	c.readyCh <- struct{}{}
 
+	return c.waitForShutdownOrFatal(ctx)
+}
+
+// waitForShutdownOrFatal blocks until a clean shutdown signal or a fatal
+// error, whichever comes first, and reports which happened. Split out from
+// run so it can be unit-tested directly without driving the whole bootstrap
+// sequence above it.
+func (c *connector) waitForShutdownOrFatal(ctx context.Context) error {
 	select {
 	case <-c.cancelCh:
 		logger.Debug("cancel channel triggered")
 		return nil
 	case err := <-c.fatalCh:
+		return err
+	case err := <-c.stream.Err():
+		// The replication stream's own sink goroutine gave up after an
+		// unrecoverable connection loss (Reconnect disabled or exhausted).
+		// It cannot be intercepted via runGuarded/fatalCh like the
+		// connector's own background goroutines: it is spawned inside
+		// pq/replication, a different goroutine tree, and used to panic
+		// the whole process for exactly that reason. It now reports here
+		// instead.
 		return err
 	case <-ctx.Done():
 		return ctx.Err()

@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -211,26 +212,30 @@ func TestSinkLoopDoesNotTreatTerminationAsCorruptedWhenAlreadyClosed(t *testing.
 	}
 }
 
-func TestSinkPanicsAfterClosingOnUnexpectedDisconnect(t *testing.T) {
+// TestSinkReportsFatalErrorAfterClosingOnUnexpectedDisconnect verifies that
+// an unexpected disconnect closes the stream and reports ErrStreamCorrupted
+// on Err() (T3.3 replaced the previous panic-to-force-a-process-restart with
+// this, so a caller like cdc.Connector.Run can surface it as a normal
+// returned error instead).
+func TestSinkReportsFatalErrorAfterClosingOnUnexpectedDisconnect(t *testing.T) {
 	logger.InitLogger(logger.NewSlog(slog.LevelError))
 
 	stream := NewStream("", config.Config{}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
 	stream.conn = eofConn{}
 
-	defer func() {
-		recovered := recover()
-		if recovered == nil {
-			t.Fatal("expected panic after unexpected disconnect so the process restarts with a fresh connection")
-		}
-		if recovered != "corrupted connection" {
-			t.Fatalf("unexpected panic value: %v", recovered)
-		}
-		if !stream.closed.Load() {
-			t.Fatal("expected the stream to close before panicking")
-		}
-	}()
-
 	stream.sink(context.Background())
+
+	select {
+	case err := <-stream.Err():
+		if !errors.Is(err, ErrStreamCorrupted) {
+			t.Fatalf("unexpected fatal error: %v", err)
+		}
+	default:
+		t.Fatal("expected a fatal error on Err() after unexpected disconnect")
+	}
+	if !stream.closed.Load() {
+		t.Fatal("expected the stream to close before reporting the fatal error")
+	}
 }
 
 func TestReplicationConnectionTerminationErrors(t *testing.T) {

@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -272,31 +273,31 @@ func (alwaysCorruptConn) ReceiveMessage(context.Context) (pgproto3.BackendMessag
 	return nil, io.ErrUnexpectedEOF
 }
 
-// TestSinkPanicsAfterReconnectBudgetExhausted proves A4 doesn't change the
-// ultimate failure mode when reconnecting is enabled but never succeeds: the
-// process still panics with the same message as before, just after trying to
-// recover in-process first.
-func TestSinkPanicsAfterReconnectBudgetExhausted(t *testing.T) {
+// TestSinkReportsFatalErrorAfterReconnectBudgetExhausted proves A4 doesn't
+// change the ultimate failure mode when reconnecting is enabled but never
+// succeeds: the stream reports ErrStreamCorrupted on Err() (replacing the
+// panic this used to raise, see T3.3), just after trying to recover
+// in-process first.
+func TestSinkReportsFatalErrorAfterReconnectBudgetExhausted(t *testing.T) {
 	s := newTestReconnectStream(config.ReconnectConfig{
 		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond,
 		MaxJitter: time.Millisecond, MaxElapsed: 20 * time.Millisecond,
 	})
 	s.conn = alwaysCorruptConn{}
 
-	defer func() {
-		recovered := recover()
-		if recovered == nil {
-			t.Fatal("expected panic after reconnect budget exhausted")
-		}
-		if recovered != "corrupted connection" {
-			t.Fatalf("unexpected panic value: %v", recovered)
-		}
-		if !s.closed.Load() {
-			t.Fatal("expected the stream to close before panicking")
-		}
-	}()
-
 	s.sink(context.Background())
+
+	select {
+	case err := <-s.Err():
+		if !errors.Is(err, ErrStreamCorrupted) {
+			t.Fatalf("unexpected fatal error: %v", err)
+		}
+	default:
+		t.Fatal("expected a fatal error on Err() after reconnect budget exhausted")
+	}
+	if !s.closed.Load() {
+		t.Fatal("expected the stream to close before reporting the fatal error")
+	}
 }
 
 // recoversOnSecondConnectConn simulates a real disconnect/reconnect cycle
@@ -382,23 +383,24 @@ func TestSinkRecoversAfterReconnectAndDoesNotPanic(t *testing.T) {
 	}
 }
 
-// TestSinkPanicsImmediatelyWhenReconnectDisabled documents, alongside the
-// pre-existing TestSinkPanicsAfterClosingOnUnexpectedDisconnect, that leaving
-// Reconnect.Enabled false (the default) preserves today's exact behavior: an
-// unexpected disconnect panics immediately with no reconnect attempt at all.
-func TestSinkPanicsImmediatelyWhenReconnectDisabled(t *testing.T) {
+// TestSinkReportsFatalErrorImmediatelyWhenReconnectDisabled documents,
+// alongside the pre-existing TestSinkReportsFatalErrorAfterClosingOnUnexpectedDisconnect,
+// that leaving Reconnect.Enabled false (the default) preserves today's exact
+// behavior other than the panic->error change from T3.3: an unexpected
+// disconnect reports ErrStreamCorrupted immediately with no reconnect
+// attempt at all.
+func TestSinkReportsFatalErrorImmediatelyWhenReconnectDisabled(t *testing.T) {
 	s := newTestReconnectStream(config.ReconnectConfig{Enabled: false})
 	s.conn = alwaysCorruptConn{}
 
-	defer func() {
-		recovered := recover()
-		if recovered == nil {
-			t.Fatal("expected panic after unexpected disconnect when reconnect is disabled")
-		}
-		if recovered != "corrupted connection" {
-			t.Fatalf("unexpected panic value: %v", recovered)
-		}
-	}()
-
 	s.sink(context.Background())
+
+	select {
+	case err := <-s.Err():
+		if !errors.Is(err, ErrStreamCorrupted) {
+			t.Fatalf("unexpected fatal error: %v", err)
+		}
+	default:
+		t.Fatal("expected a fatal error on Err() after unexpected disconnect when reconnect is disabled")
+	}
 }
