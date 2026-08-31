@@ -2,7 +2,6 @@ package replication
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -17,6 +16,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
+
+// fakeDialError simulates a realistic transient network error, the way a real
+// TCP dial failure actually surfaces (e.g. *net.OpError, which implements
+// net.Error). A bare errors.New(...) does not implement net.Error and is
+// correctly classified permanent by pq.IsRetryableConnectionError, so these
+// fakes must use this type to keep simulating a transient failure.
+type fakeDialError struct{ msg string }
+
+func (e fakeDialError) Error() string { return e.msg }
+func (fakeDialError) Timeout() bool   { return false }
+func (fakeDialError) Temporary() bool { return true }
+
+var errDialRefused = fakeDialError{msg: "dial refused"}
 
 // reconnectFakeConn is a pq.Connection fake for driving stream.reconnect()
 // directly. Connect() fails for its first failConnectUntil calls and
@@ -43,7 +55,7 @@ func (c *reconnectFakeConn) Connect(context.Context) error {
 	defer c.mu.Unlock()
 	c.connectCalls++
 	if c.connectCalls <= c.failConnectUntil {
-		return errors.New("dial refused")
+		return errDialRefused
 	}
 	c.closed = false
 	return nil
@@ -122,6 +134,61 @@ func TestReconnectGivesUpAfterMaxElapsed(t *testing.T) {
 	}
 }
 
+// permanentAuthErrorConn simulates a connection that fails Connect() with a
+// permanent PostgreSQL error (e.g. a credential rotated to an invalid
+// password) on every attempt -- retrying it can never succeed.
+type permanentAuthErrorConn struct{ connectCalls *int }
+
+func newPermanentAuthErrorConn() *permanentAuthErrorConn {
+	return &permanentAuthErrorConn{connectCalls: new(int)}
+}
+
+func (c *permanentAuthErrorConn) Connect(context.Context) error {
+	*c.connectCalls++
+	return &pgconn.PgError{Code: "28P01", Message: "password authentication failed"}
+}
+
+func (*permanentAuthErrorConn) IsClosed() bool                                         { return true }
+func (*permanentAuthErrorConn) Close(context.Context) error                            { return nil }
+func (*permanentAuthErrorConn) Frontend() *pgproto3.Frontend                           { return nil }
+func (*permanentAuthErrorConn) Exec(context.Context, string) *pgconn.MultiResultReader { return nil }
+func (*permanentAuthErrorConn) ReceiveMessage(context.Context) (pgproto3.BackendMessage, error) {
+	return nil, errDialRefused // unreachable: Connect always fails first
+}
+
+// TestReconnectFailsFastOnPermanentError verifies a permanent error (e.g. a
+// rotated-away password) stops retrying immediately instead of consuming the
+// whole MaxElapsed budget on an attempt that can never succeed.
+//
+// MaxElapsed is set to a deliberately absurd 1 hour: if the classification
+// were broken and reconnect fell back to retrying on wall-clock alone, this
+// test would hang for up to an hour instead of failing fast -- an
+// unmistakable signal rather than a coincidence of timing (the same
+// technique that caught the *pgconn.ConnectError ordering bug in
+// cdc.IsRetryableStartupError).
+func TestReconnectFailsFastOnPermanentError(t *testing.T) {
+	s := newTestReconnectStream(config.ReconnectConfig{
+		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond,
+		MaxJitter: time.Millisecond, MaxElapsed: time.Hour,
+	})
+	conn := newPermanentAuthErrorConn()
+	s.conn = conn
+
+	start := time.Now()
+	ok := s.reconnect(context.Background())
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("expected reconnect to give up on a permanent authentication error")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("reconnect took %s to give up with MaxElapsed=1h; classification is not failing fast", elapsed)
+	}
+	if got := *conn.connectCalls; got != 1 {
+		t.Fatalf("expected exactly 1 Connect() attempt before giving up on a permanent error, got %d", got)
+	}
+}
+
 func TestReconnectNotAttemptedWhenAlreadyClosed(t *testing.T) {
 	s := newTestReconnectStream(config.ReconnectConfig{
 		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond,
@@ -191,7 +258,7 @@ func TestReconnectStopsWhenContextCancelledMidWait(t *testing.T) {
 // fail, and so does every reconnect attempt.
 type alwaysCorruptConn struct{}
 
-func (alwaysCorruptConn) Connect(context.Context) error { return errors.New("dial refused") }
+func (alwaysCorruptConn) Connect(context.Context) error { return errDialRefused }
 
 func (alwaysCorruptConn) IsClosed() bool { return true }
 
@@ -250,7 +317,7 @@ func (c *recoversOnSecondConnectConn) Connect(context.Context) error {
 	defer c.mu.Unlock()
 	c.connectCalls++
 	if c.connectCalls == 1 {
-		return errors.New("dial refused")
+		return errDialRefused
 	}
 	return nil
 }
