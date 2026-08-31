@@ -368,6 +368,15 @@ reconnect:
   maxElapsed: 5m
 ```
 
+### Delivery Guarantees
+
+This library provides **at-least-once** delivery with an unbounded duplicate window; it never drops a change, but it can redeliver one.
+
+- `ListenerContext.Ack()` confirms `Message`'s WAL position (`walStart`) in memory. For the last change in a non-streamed transaction, `walStart` is rewritten to `COMMIT`'s transaction-end LSN before delivery; for the last change in a streamed transaction, it's rewritten to `STREAM COMMIT`'s transaction-end LSN. Every other change in the transaction keeps its own original LSN.
+- Acking does not immediately write to PostgreSQL — it only advances the in-memory confirmed position. That position is flushed to the server (as the replication slot's `confirmed_flush_lsn`) by the periodic `lsnFlushInterval` ticker, by a keepalive reply, or when the sink's read loop goes idle. See `lsnFlushInterval` in [Configuration](#configuration).
+- On any reconnect — in-process (`reconnect.enabled: true`) or a fresh process restart — streaming always resumes from the slot's last **server-side** `confirmed_flush_lsn`, never from anything held in memory (see [Reconnect](#reconnect)). This is deliberately data-loss-safe: nothing acked-but-not-yet-flushed to the server is ever skipped.
+- The consequence is a duplicate window that is bounded below (never replays anything already flushed) but **unbounded above**: every change received but not yet acked-and-flushed at the moment of disconnect is redelivered after resume, however large that in-flight set was. Consumers must be idempotent (e.g. upsert by primary key, or dedupe using `CommitLSN`/`XID`) rather than assuming exactly-once delivery.
+
 ### Error Handling
 
 Most errors this library returns are wrapped in a [`go-playground/errors`](https://github.com/go-playground/errors) `Chain`, which does **not** implement `Unwrap() error`. Standard library `errors.Is`/`errors.As` cannot see through that wrapping to match a cause underneath it — a plain `errors.Is(err, someSentinel)` will silently return `false` even when `someSentinel` really is the cause.
