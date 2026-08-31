@@ -2,8 +2,10 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq/message"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -272,31 +275,31 @@ func (alwaysCorruptConn) ReceiveMessage(context.Context) (pgproto3.BackendMessag
 	return nil, io.ErrUnexpectedEOF
 }
 
-// TestSinkPanicsAfterReconnectBudgetExhausted proves A4 doesn't change the
-// ultimate failure mode when reconnecting is enabled but never succeeds: the
-// process still panics with the same message as before, just after trying to
-// recover in-process first.
-func TestSinkPanicsAfterReconnectBudgetExhausted(t *testing.T) {
+// TestSinkReportsFatalErrorAfterReconnectBudgetExhausted proves A4 doesn't
+// change the ultimate failure mode when reconnecting is enabled but never
+// succeeds: the stream reports ErrStreamCorrupted on Err() (replacing the
+// panic this used to raise, see T3.3), just after trying to recover
+// in-process first.
+func TestSinkReportsFatalErrorAfterReconnectBudgetExhausted(t *testing.T) {
 	s := newTestReconnectStream(config.ReconnectConfig{
 		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond,
 		MaxJitter: time.Millisecond, MaxElapsed: 20 * time.Millisecond,
 	})
 	s.conn = alwaysCorruptConn{}
 
-	defer func() {
-		recovered := recover()
-		if recovered == nil {
-			t.Fatal("expected panic after reconnect budget exhausted")
-		}
-		if recovered != "corrupted connection" {
-			t.Fatalf("unexpected panic value: %v", recovered)
-		}
-		if !s.closed.Load() {
-			t.Fatal("expected the stream to close before panicking")
-		}
-	}()
-
 	s.sink(context.Background())
+
+	select {
+	case err := <-s.Err():
+		if !errors.Is(err, ErrStreamCorrupted) {
+			t.Fatalf("unexpected fatal error: %v", err)
+		}
+	default:
+		t.Fatal("expected a fatal error on Err() after reconnect budget exhausted")
+	}
+	if !s.closed.Load() {
+		t.Fatal("expected the stream to close before reporting the fatal error")
+	}
 }
 
 // recoversOnSecondConnectConn simulates a real disconnect/reconnect cycle
@@ -380,25 +383,154 @@ func TestSinkRecoversAfterReconnectAndDoesNotPanic(t *testing.T) {
 	if conn.connectCalls != 2 {
 		t.Fatalf("expected exactly 2 Connect() calls (1 failed + 1 succeeded), got %d", conn.connectCalls)
 	}
+	// The real assertion since T3.3 removed the panic: recover() above would
+	// never fire regardless of whether the fix is correct, since nothing in
+	// this path panics anymore. What must actually hold is that a
+	// successful reconnect followed by a clean shutdown never reports a
+	// fatal error -- Err() must stay empty.
+	select {
+	case err := <-s.Err():
+		t.Fatalf("expected no fatal error after a successful reconnect and clean shutdown, got %v", err)
+	default:
+	}
 }
 
-// TestSinkPanicsImmediatelyWhenReconnectDisabled documents, alongside the
-// pre-existing TestSinkPanicsAfterClosingOnUnexpectedDisconnect, that leaving
-// Reconnect.Enabled false (the default) preserves today's exact behavior: an
-// unexpected disconnect panics immediately with no reconnect attempt at all.
-func TestSinkPanicsImmediatelyWhenReconnectDisabled(t *testing.T) {
+// reconnectThenKeepaliveConn simulates a real disconnect/reconnect cycle
+// followed by ordinary, ongoing operation (harmless keepalives) rather than
+// an immediate second failure manufactured by the fake itself. This proves
+// Err() stays empty across a genuinely external, deliberate Close() call
+// arriving after the stream has resumed normally -- recoversOnSecondConnectConn
+// above instead has its own 3rd ReceiveMessage call flip s.closed directly,
+// which trivially short-circuits the fatal-send guard before "corrupted"
+// is ever consulted and so cannot catch a regression there.
+type reconnectThenKeepaliveConn struct {
+	mu           sync.Mutex
+	connectCalls int
+	recvCalls    int
+	closed       bool
+}
+
+func (c *reconnectThenKeepaliveConn) Connect(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.connectCalls++
+	if c.connectCalls == 1 {
+		return errDialRefused
+	}
+	c.closed = false
+	return nil
+}
+
+func (c *reconnectThenKeepaliveConn) IsClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+func (c *reconnectThenKeepaliveConn) Close(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	return nil
+}
+
+func (c *reconnectThenKeepaliveConn) Frontend() *pgproto3.Frontend {
+	return pgproto3.NewFrontend(strings.NewReader(""), io.Discard)
+}
+
+func (c *reconnectThenKeepaliveConn) Exec(context.Context, string) *pgconn.MultiResultReader {
+	return nil
+}
+
+func (c *reconnectThenKeepaliveConn) ReceiveMessage(context.Context) (pgproto3.BackendMessage, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	c.recvCalls++
+	n := c.recvCalls
+	c.mu.Unlock()
+
+	switch n {
+	case 1:
+		// sinkLoop's first read: looks like an unexpected disconnect.
+		return nil, io.ErrUnexpectedEOF
+	case 2:
+		// replication.Test(), called from setup() during the successful
+		// reconnect attempt, expects this on the handshake.
+		return &pgproto3.CopyBothResponse{}, nil
+	default:
+		// Normal operation resumed: a harmless keepalive with no reply
+		// requested, repeated until Close() is called from outside.
+		data := make([]byte, 18)
+		data[0] = message.PrimaryKeepaliveMessageByteID
+		return &pgproto3.CopyData{Data: data}, nil
+	}
+}
+
+// TestSinkErrStaysEmptyAfterSuccessfulReconnectAndExternalClose answers the
+// question TestSinkRecoversAfterReconnectAndDoesNotPanic cannot: after a
+// successful reconnect, the stream keeps running normally (unlike that
+// test's fake, which self-closes on its very next read) and is then closed
+// deliberately from outside, the way an application actually would. Err()
+// must stay empty throughout.
+func TestSinkErrStaysEmptyAfterSuccessfulReconnectAndExternalClose(t *testing.T) {
+	s := newTestReconnectStream(config.ReconnectConfig{
+		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond,
+		MaxJitter: time.Millisecond, MaxElapsed: 5 * time.Second,
+	})
+	conn := &reconnectThenKeepaliveConn{}
+	s.conn = conn
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.sink(context.Background())
+	}()
+
+	// Give it time to fail once, reconnect, and settle into normal
+	// keepalive operation well past the reconnect.
+	time.Sleep(100 * time.Millisecond)
+
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink() did not exit after Close()")
+	}
+
+	select {
+	case err := <-s.Err():
+		t.Fatalf("expected no fatal error after a deliberate Close() following a successful reconnect and normal operation, got %v", err)
+	default:
+	}
+	if got := conn.connectCalls; got != 2 {
+		t.Fatalf("expected exactly 2 Connect() calls (1 failed + 1 succeeded), got %d", got)
+	}
+}
+
+// TestSinkReportsFatalErrorImmediatelyWhenReconnectDisabled documents,
+// alongside the pre-existing TestSinkReportsFatalErrorAfterClosingOnUnexpectedDisconnect,
+// that leaving Reconnect.Enabled false (the default) preserves today's exact
+// behavior other than the panic->error change from T3.3: an unexpected
+// disconnect reports ErrStreamCorrupted immediately with no reconnect
+// attempt at all.
+func TestSinkReportsFatalErrorImmediatelyWhenReconnectDisabled(t *testing.T) {
 	s := newTestReconnectStream(config.ReconnectConfig{Enabled: false})
 	s.conn = alwaysCorruptConn{}
 
-	defer func() {
-		recovered := recover()
-		if recovered == nil {
-			t.Fatal("expected panic after unexpected disconnect when reconnect is disabled")
-		}
-		if recovered != "corrupted connection" {
-			t.Fatalf("unexpected panic value: %v", recovered)
-		}
-	}()
-
 	s.sink(context.Background())
+
+	select {
+	case err := <-s.Err():
+		if !errors.Is(err, ErrStreamCorrupted) {
+			t.Fatalf("unexpected fatal error: %v", err)
+		}
+	default:
+		t.Fatal("expected a fatal error on Err() after unexpected disconnect when reconnect is disabled")
+	}
 }

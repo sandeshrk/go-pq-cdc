@@ -33,6 +33,11 @@ var (
 	// plain stdlib errors.
 	ErrorSlotInUse    = goerrors.New("replication slot in use")
 	ErrorNotConnected = goerrors.New("stream is not connected")
+	// ErrStreamCorrupted is sent on Err() when the sink goroutine gives up
+	// after an unrecoverable connection loss: Reconnect is disabled (the
+	// default), or its budget was exhausted. The replication stream is dead
+	// at that point; a caller must build a new connector/stream to recover.
+	ErrStreamCorrupted = goerrors.New("replication stream corrupted: connection lost and reconnect is disabled or exhausted")
 )
 
 const (
@@ -62,6 +67,12 @@ type Streamer interface {
 	GetSystemInfo() *pq.IdentifySystemResult
 	GetMetric() metric.Metric
 	OpenFromSnapshotLSN()
+	// Err returns a channel that receives at most one value: a fatal error
+	// if the sink goroutine gives up after an unrecoverable connection loss
+	// (Reconnect disabled, or its budget exhausted). A caller running the
+	// stream (see cdc.Connector.Run) should select on this alongside its own
+	// shutdown signals; nothing is sent here on a deliberate Close().
+	Err() <-chan error
 }
 
 type stream struct {
@@ -75,6 +86,7 @@ type stream struct {
 	sinkEnd             chan struct{}
 	processEnd          chan struct{}
 	flushTickerEnd      chan struct{}
+	fatalCh             chan error
 	mu                  *sync.RWMutex
 	config              config.Config
 	lastXLogPos         pq.LSN
@@ -112,6 +124,7 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 		sinkEnd:        make(chan struct{}, 1),
 		processEnd:     make(chan struct{}, 1),
 		flushTickerEnd: make(chan struct{}, 1),
+		fatalCh:        make(chan error, 1),
 		mu:             &sync.RWMutex{},
 	}
 }
@@ -458,7 +471,9 @@ func (s *stream) sink(ctx context.Context) {
 			logger.Error("replication stream shutdown failed", "error", err)
 		}
 		if corrupted {
-			panic("corrupted connection")
+			// Buffered by 1 and sent at most once per stream, so this never
+			// blocks even if nothing is listening on Err().
+			s.fatalCh <- ErrStreamCorrupted
 		}
 	}
 }
@@ -974,6 +989,10 @@ func (s *stream) GetSystemInfo() *pq.IdentifySystemResult {
 
 func (s *stream) GetMetric() metric.Metric {
 	return s.metric
+}
+
+func (s *stream) Err() <-chan error {
+	return s.fatalCh
 }
 
 func (s *stream) SetSnapshotLSN(lsn pq.LSN) {
