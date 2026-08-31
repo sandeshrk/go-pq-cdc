@@ -76,22 +76,30 @@ type Streamer interface {
 }
 
 type stream struct {
-	metric              metric.Metric
-	conn                pq.Connection
-	cancel              context.CancelFunc
-	system              *pq.IdentifySystemResult
-	relation            map[uint32]*format.Relation
-	messageCH           chan *Message
-	listenerFunc        ListenerFunc
-	sinkEnd             chan struct{}
-	processEnd          chan struct{}
-	flushTickerEnd      chan struct{}
-	fatalCh             chan error
-	mu                  *sync.RWMutex
-	config              config.Config
-	lastXLogPos         pq.LSN
-	snapshotLSN         pq.LSN
-	confirmedXLogPos    pq.LSN
+	metric           metric.Metric
+	conn             pq.Connection
+	cancel           context.CancelFunc
+	system           *pq.IdentifySystemResult
+	relation         map[uint32]*format.Relation
+	messageCH        chan *Message
+	listenerFunc     ListenerFunc
+	sinkEnd          chan struct{}
+	processEnd       chan struct{}
+	flushTickerEnd   chan struct{}
+	fatalCh          chan error
+	mu               *sync.RWMutex
+	config           config.Config
+	lastXLogPos      pq.LSN
+	snapshotLSN      pq.LSN
+	confirmedXLogPos pq.LSN
+	// deliveredHighWaterMark is the highest walStart ever handed to
+	// listenerFunc. Used to compute replayFloor on a reconnect; see T2.2 in
+	// the Delivery Guarantees README section.
+	deliveredHighWaterMark pq.LSN
+	// replayFloor is set to deliveredHighWaterMark on a successful reconnect.
+	// Every delivered message with walStart <= replayFloor was already
+	// delivered before the disconnect, i.e. it's a replay, not new data.
+	replayFloor         pq.LSN
 	messageCloseOnce    sync.Once
 	connMu              sync.Mutex
 	closed              atomic.Bool
@@ -565,6 +573,7 @@ func (s *stream) reconnect(ctx context.Context) bool {
 
 	logger.Info("replication stream reconnected", "elapsed", time.Since(start).String())
 	s.metric.ReconnectSuccessIncrement()
+	s.markReplayFloor()
 	return true
 }
 
@@ -845,6 +854,11 @@ func (s *stream) process(ctx context.Context) {
 				Ack:     ackFunc,
 			}
 
+			if pq.LSN(msg.walStart) <= s.loadReplayFloor() {
+				s.metric.ReplayedMessageIncrement()
+			}
+			s.updateDeliveredHighWaterMark(pq.LSN(msg.walStart))
+
 			switch lCtx.Message.(type) {
 			case *format.Insert:
 				s.metric.InsertOpIncrement(1)
@@ -1027,6 +1041,41 @@ func (s *stream) LoadConfirmedXLogPos() pq.LSN {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.confirmedXLogPos
+}
+
+func (s *stream) updateDeliveredHighWaterMark(l pq.LSN) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.deliveredHighWaterMark < l {
+		s.deliveredHighWaterMark = l
+	}
+}
+
+func (s *stream) loadDeliveredHighWaterMark() pq.LSN {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.deliveredHighWaterMark
+}
+
+// markReplayFloor records the current delivered high-water mark as the
+// replay floor after a successful reconnect. It never decreases:
+// deliveredHighWaterMark itself is monotonic, so a later reconnect can only
+// raise the floor, matching the same update-if-greater pattern used
+// elsewhere in this file.
+func (s *stream) markReplayFloor() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.replayFloor < s.deliveredHighWaterMark {
+		s.replayFloor = s.deliveredHighWaterMark
+	}
+}
+
+func (s *stream) loadReplayFloor() pq.LSN {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.replayFloor
 }
 
 // updateUnackedLagMetric reports how far the highest received WAL position is

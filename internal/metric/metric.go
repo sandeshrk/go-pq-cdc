@@ -47,6 +47,11 @@ type Metric interface {
 	ReconnectSuccessIncrement()
 	ReconnectFailureIncrement()
 	SetReconnecting(active bool)
+	// ReplayedMessageIncrement counts a message redelivered after an
+	// in-process reconnect because it was already delivered (but not
+	// necessarily acked) before the disconnect. See the Delivery Guarantees
+	// section of the README.
+	ReplayedMessageIncrement()
 
 	PrometheusCollectors() []prometheus.Collector
 }
@@ -85,6 +90,7 @@ type metric struct {
 	reconnectSuccesses prometheus.Counter
 	reconnectFailures  prometheus.Counter
 	reconnecting       prometheus.Gauge
+	replayedMessages   prometheus.Counter
 }
 
 //nolint:funlen
@@ -351,6 +357,16 @@ func NewMetric(slotName string) Metric {
 				"host":      hostname,
 			},
 		}),
+		replayedMessages: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "reconnect",
+			Name:      "replayed_messages_total",
+			Help:      "total number of messages redelivered after an in-process reconnect because they were already delivered before the disconnect",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
 	}
 }
 
@@ -382,6 +398,7 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.reconnectSuccesses,
 		m.reconnectFailures,
 		m.reconnecting,
+		m.replayedMessages,
 	}
 }
 
@@ -494,4 +511,8 @@ func (m *metric) SetReconnecting(active bool) {
 		value = 1.0
 	}
 	m.reconnecting.Set(value)
+}
+
+func (m *metric) ReplayedMessageIncrement() {
+	m.replayedMessages.Inc()
 }
