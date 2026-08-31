@@ -377,6 +377,8 @@ This library provides **at-least-once** delivery with an unbounded duplicate win
 - On any reconnect — in-process (`reconnect.enabled: true`) or a fresh process restart — streaming always resumes from the slot's last **server-side** `confirmed_flush_lsn`, never from anything held in memory (see [Reconnect](#reconnect)). This is deliberately data-loss-safe: nothing acked-but-not-yet-flushed to the server is ever skipped.
 - The consequence is a duplicate window that is bounded below (never replays anything already flushed) but **unbounded above**: every change received but not yet acked-and-flushed at the moment of disconnect is redelivered after resume, however large that in-flight set was. Consumers must be idempotent (e.g. upsert by primary key, or dedupe using `CommitLSN`/`XID`) rather than assuming exactly-once delivery.
 - `go_pq_cdc_reconnect_replayed_messages_total` measures exactly how large that window turns out to be in practice: it counts every delivered message whose WAL position was already delivered before the most recent reconnect.
+- `ListenerContext.WALStart`/`CommitLSN` expose the same positions `Ack()` operates on, so a consumer can persist its own checkpoint instead of only reacting to each message. `CommitLSN` is 0 for message types with no commit context (e.g. `Relation`, `Truncate`).
+- `ListenerContext.AckLSN(lsn)` confirms an arbitrary LSN rather than only the current message's `WALStart` -- useful for a transactional sink that buffers a whole transaction, writes it atomically to its own store, and only then wants to confirm a position it computed itself. Like `UpdateConfirmedXLogPos`, a non-monotonic value (at or below the already-confirmed position) is a silent no-op rather than an error.
 
 ### Error Handling
 
