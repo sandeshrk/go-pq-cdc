@@ -68,6 +68,8 @@ func TestReconnectMetricsRegisteredAsCollectors(t *testing.T) {
 			found["failures"] = true
 		case m.reconnecting:
 			found["reconnecting"] = true
+		case m.replayedMessages:
+			found["replayedMessages"] = true
 		}
 	}
 
@@ -75,4 +77,15 @@ func TestReconnectMetricsRegisteredAsCollectors(t *testing.T) {
 	assert.True(t, found["successes"])
 	assert.True(t, found["failures"])
 	assert.True(t, found["reconnecting"])
+	assert.True(t, found["replayedMessages"])
+}
+
+func TestReplayedMessageMetric(t *testing.T) {
+	m := NewMetric("test_slot").(*metric)
+
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.replayedMessages))
+
+	m.ReplayedMessageIncrement()
+	m.ReplayedMessageIncrement()
+	assert.Equal(t, float64(2), testutil.ToFloat64(m.replayedMessages))
 }
