@@ -50,7 +50,20 @@ const (
 type ListenerContext struct {
 	Context context.Context
 	Message any
-	Ack     func() error
+	// WALStart is this message's own WAL position: Ack confirms this value,
+	// rewritten to the transaction-end LSN for the last change in a
+	// transaction. See the Delivery Guarantees section of the README.
+	WALStart pq.LSN
+	// CommitLSN is the commit record's own LSN (BEGIN.FinalLSN / STREAM
+	// COMMIT.CommitLSN) for Insert/Update/Delete messages, 0 for message
+	// types that carry no commit context (e.g. Relation, Truncate).
+	CommitLSN pq.LSN
+	Ack       func() error
+	// AckLSN confirms an arbitrary LSN instead of only WALStart, letting a
+	// transactional sink confirm a position it computed itself (e.g. after
+	// writing a whole transaction to its own store). A non-monotonic value
+	// (<= the already-confirmed position) is a silent no-op.
+	AckLSN func(lsn pq.LSN) error
 }
 
 type ListenerFunc func(ctx *ListenerContext)
@@ -727,6 +740,21 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
 }
 
+// commitLSNOf returns a DML message's stamped CommitLSN, or 0 for message
+// types that carry no commit context (e.g. Relation, Truncate).
+func commitLSNOf(msg any) pq.LSN {
+	switch m := msg.(type) {
+	case *format.Insert:
+		return m.CommitLSN
+	case *format.Update:
+		return m.CommitLSN
+	case *format.Delete:
+		return m.CommitLSN
+	default:
+		return 0
+	}
+}
+
 // stampCommit sets the transaction commit context on a DML change message.
 // It reports whether msg was a DML message.
 func stampCommit(msg any, commitTime time.Time, commitLSN pq.LSN, xid uint32) bool {
@@ -829,16 +857,19 @@ func (s *stream) process(ctx context.Context) {
 				continue
 			}
 
-			// Ack only advances the confirmed position in memory; the standby
+			// Ack/AckLSN only advance the confirmed position in memory; the standby
 			// status update is flushed to Postgres by the sink loop (idle-timeout
 			// and keepalive-reply paths) or by flushTicker (config.LSNFlushInterval).
 			// Sending it here per message serializes every ack behind the sink's
 			// connMu-held read, collapsing throughput to a few messages/sec while
 			// a buffered transaction is drained.
-			ackFunc := func() error {
-				s.UpdateConfirmedXLogPos(pq.LSN(msg.walStart))
+			ackLSNFunc := func(lsn pq.LSN) error {
+				s.UpdateConfirmedXLogPos(lsn)
 				s.updateUnackedLagMetric()
 				return nil
+			}
+			ackFunc := func() error {
+				return ackLSNFunc(pq.LSN(msg.walStart))
 			}
 
 			if s.isHeartbeatMessage(msg.message) {
@@ -849,9 +880,12 @@ func (s *stream) process(ctx context.Context) {
 			}
 
 			lCtx := &ListenerContext{
-				Context: ctx,
-				Message: msg.message,
-				Ack:     ackFunc,
+				Context:   ctx,
+				Message:   msg.message,
+				WALStart:  pq.LSN(msg.walStart),
+				CommitLSN: commitLSNOf(msg.message),
+				Ack:       ackFunc,
+				AckLSN:    ackLSNFunc,
 			}
 
 			if pq.LSN(msg.walStart) <= s.loadReplayFloor() {

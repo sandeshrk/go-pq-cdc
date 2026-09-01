@@ -698,6 +698,9 @@ func (c *connector) snapshotHandler(event *format.Snapshot) error {
 		Ack: func() error {
 			return nil // ACK isn't required for snapshot
 		},
+		AckLSN: func(pq.LSN) error {
+			return nil // ACK isn't required for snapshot
+		},
 	})
 	return nil
 }
