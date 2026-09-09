@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMergeDesiredPublicationTables(t *testing.T) {
@@ -36,13 +37,29 @@ func TestMergeDesiredPublicationTables(t *testing.T) {
 		assert.False(t, changed)
 	})
 
-	t.Run("configured table missing from live publication is ignored, not added", func(t *testing.T) {
+	t.Run("configured table missing from live publication gets added", func(t *testing.T) {
 		actual := Tables{{Schema: "public", Name: "orders"}}
-		configured := Tables{{Schema: "public", Name: "users", PublicationFilter: "status = 'active'"}}
+		configured := Tables{
+			{Schema: "public", Name: "orders"},
+			{Schema: "public", Name: "users", PublicationFilter: "status = 'active'"},
+		}
 
 		desired, changed := mergeDesiredPublicationTables(actual, configured, false)
-		assert.False(t, changed)
-		assert.Equal(t, actual, desired)
+		assert.True(t, changed)
+		require.Len(t, desired, 2)
+		assert.Equal(t, actual[0], desired[0], "already-live table must be carried over unchanged")
+		assert.Equal(t, "users", desired[1].Name)
+		assert.Equal(t, "status = 'active'", desired[1].PublicationFilter)
+	})
+
+	t.Run("ClearPublicationFilter sentinel on a brand new table resolves to no filter", func(t *testing.T) {
+		actual := Tables{}
+		configured := Tables{{Schema: "public", Name: "users", PublicationFilter: ClearPublicationFilter}}
+
+		desired, changed := mergeDesiredPublicationTables(actual, configured, false)
+		assert.True(t, changed)
+		require.Len(t, desired, 1)
+		assert.Empty(t, desired[0].PublicationFilter)
 	})
 
 	t.Run("empty configured filter leaves the live filter untouched", func(t *testing.T) {

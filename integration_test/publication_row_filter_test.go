@@ -380,3 +380,168 @@ func TestApplyPublicationFiltersPruneTables(t *testing.T) {
 	require.Len(t, tables, 1, "table missing from config should have been dropped")
 	assert.Equal(t, "row_filter_prune_keep", tables[0].Name)
 }
+
+// TestApplyPublicationFiltersAddsMissingTable verifies that a table present
+// in config but not yet a member of an already-existing publication gets
+// added (with its configured filter), and that it's fully usable afterward.
+func TestApplyPublicationFiltersAddsMissingTable(t *testing.T) {
+	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	postgresConn, err := newPostgresConn()
+	require.NoError(t, err)
+	defer postgresConn.Close(ctx)
+
+	pubName := "pub_row_filter_add_table"
+
+	require.NoError(t, pgExec(ctx, postgresConn, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", pubName)))
+	require.NoError(t, pgExec(ctx, postgresConn, `
+		DROP TABLE IF EXISTS row_filter_add_existing, row_filter_add_new;
+		CREATE TABLE row_filter_add_existing (id SERIAL PRIMARY KEY);
+		CREATE TABLE row_filter_add_new (id SERIAL PRIMARY KEY, status TEXT NOT NULL);
+		ALTER TABLE row_filter_add_new REPLICA IDENTITY FULL;
+	`))
+
+	t.Cleanup(func() {
+		_ = pgExec(ctx, postgresConn, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", pubName))
+		_ = pgExec(ctx, postgresConn, "DROP TABLE IF EXISTS row_filter_add_existing, row_filter_add_new")
+	})
+
+	baseCfg := publication.Config{
+		Name:              pubName,
+		CreateIfNotExists: true,
+		Operations:        publication.Operations{"INSERT", "UPDATE", "DELETE"},
+		Tables: publication.Tables{
+			{Name: "row_filter_add_existing", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityDefault},
+		},
+	}
+	pub := publication.New(baseCfg, postgresConn)
+	_, err = pub.Create(ctx)
+	require.NoError(t, err)
+
+	tables, err := pub.GetPublicationTables(ctx)
+	require.NoError(t, err)
+	require.Len(t, tables, 1, "publication should start with only the pre-existing table")
+
+	cfg := baseCfg
+	cfg.Tables = publication.Tables{
+		{Name: "row_filter_add_existing", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityDefault},
+		{Name: "row_filter_add_new", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull, PublicationFilter: "status = 'active'"},
+	}
+	require.NoError(t, publication.New(cfg, postgresConn).ApplyPublicationFilters(ctx))
+
+	tables, err = pub.GetPublicationTables(ctx)
+	require.NoError(t, err)
+	require.Len(t, tables, 2, "the new table should now be a publication member")
+
+	var newTable publication.Table
+	for _, tbl := range tables {
+		if tbl.Name == "row_filter_add_new" {
+			newTable = tbl
+		}
+	}
+	assert.Contains(t, newTable.PublicationFilter, "active")
+
+	// The added table must be fully usable: insert/update through it.
+	require.NoError(t, pgExec(ctx, postgresConn, "INSERT INTO row_filter_add_new(status) VALUES ('active')"))
+	require.NoError(t, pgExec(ctx, postgresConn, "UPDATE row_filter_add_new SET status = 'cancelled' WHERE status = 'active'"))
+}
+
+// TestAlterPublicationSafeWhileStreamActive answers "is altering the
+// publication safe while a replication stream is live": it adds a brand new
+// table to an already-running connector's publication via
+// ApplyPublicationFilters WHILE the connector is actively streaming, using a
+// separate connection (simulating another pod/process doing so concurrently),
+// then verifies the running stream is undisturbed and picks up the new
+// table's changes without a reconnect.
+func TestAlterPublicationSafeWhileStreamActive(t *testing.T) {
+	ctx := context.Background()
+
+	postgresConn, err := newPostgresConn()
+	require.NoError(t, err)
+
+	require.NoError(t, pgExec(ctx, postgresConn, `
+		DROP TABLE IF EXISTS stream_active_existing, stream_active_new;
+		CREATE TABLE stream_active_existing (id SERIAL PRIMARY KEY);
+		CREATE TABLE stream_active_new (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+	`))
+
+	cdcCfg := Config
+	cdcCfg.Slot.Name = "slot_test_alter_pub_while_active"
+	cdcCfg.Publication.Name = "pub_alter_while_active"
+	cdcCfg.Publication.CreateIfNotExists = true
+	cdcCfg.Publication.Operations = publication.Operations{
+		publication.OperationInsert,
+		publication.OperationUpdate,
+		publication.OperationDelete,
+	}
+	cdcCfg.Publication.Tables = []publication.Table{
+		{Name: "stream_active_existing", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityDefault},
+	}
+
+	insertCh := make(chan *format.Insert, 50)
+	handlerFunc := func(ctx *replication.ListenerContext) {
+		if msg, ok := ctx.Message.(*format.Insert); ok {
+			insertCh <- msg
+		}
+		_ = ctx.Ack()
+	}
+
+	connector, err := cdc.NewConnector(ctx, cdcCfg, handlerFunc)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		connector.Close()
+		_ = pgExec(ctx, postgresConn, "DROP TABLE IF EXISTS stream_active_existing, stream_active_new")
+		assert.NoError(t, RestoreDB(ctx))
+		assert.NoError(t, postgresConn.Close(ctx))
+	})
+
+	go connector.Start(ctx)
+
+	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	require.NoError(t, connector.WaitUntilReady(waitCtx))
+	cancel()
+
+	// Sanity: the stream works before the ALTER.
+	require.NoError(t, pgExec(ctx, postgresConn, "INSERT INTO stream_active_existing DEFAULT VALUES"))
+	select {
+	case <-insertCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for pre-ALTER insert")
+	}
+
+	// Alter the publication -- adding a table -- via a SEPARATE connection,
+	// while the connector's replication stream is actively connected and
+	// streaming, simulating a concurrent config change from another process.
+	alterConn, err := newPostgresConn()
+	require.NoError(t, err)
+	defer alterConn.Close(ctx)
+
+	alterCfg := cdcCfg.Publication
+	alterCfg.Tables = []publication.Table{
+		{Name: "stream_active_existing", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityDefault},
+		{Name: "stream_active_new", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityDefault},
+	}
+	require.NoError(t, publication.New(alterCfg, alterConn).ApplyPublicationFilters(ctx),
+		"ALTER PUBLICATION ... SET TABLE must succeed while a walsender is actively streaming")
+
+	// The existing table's stream must still be alive and undisturbed.
+	require.NoError(t, pgExec(ctx, postgresConn, "INSERT INTO stream_active_existing DEFAULT VALUES"))
+	select {
+	case <-insertCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for post-ALTER insert on the pre-existing table; stream may have been disrupted")
+	}
+
+	// The newly added table must stream too, with no reconnect required.
+	require.NoError(t, pgExec(ctx, postgresConn, "INSERT INTO stream_active_new(name) VALUES ('hello')"))
+	select {
+	case msg := <-insertCh:
+		assert.Equal(t, "stream_active_new", msg.TableName)
+		assert.Equal(t, "hello", msg.Decoded["name"])
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for insert on the newly added table")
+	}
+}
+

@@ -10,18 +10,20 @@ import (
 	"github.com/lib/pq"
 )
 
-// ApplyPublicationFilters reconciles native Postgres publication row filters
-// (PG 15+) and, if PruneTables is set, table membership itself, against what's
-// live. New publications get filters embedded directly in CREATE PUBLICATION,
-// so this only does work against an already-existing publication.
+// ApplyPublicationFilters reconciles an already-existing publication's live
+// table membership and row filters (PG 15+) against config: adds tables
+// present in config but not yet live, reconciles filter changes on tables
+// already live, and, if PruneTables is set, drops live tables missing from
+// config. New publications get all of this embedded directly in
+// CREATE PUBLICATION, so this only does work against an already-existing
+// publication.
 //
 // ALTER PUBLICATION ... SET TABLE replaces the publication's ENTIRE table
 // list, so the live table set is read first: tables not mentioned in config
 // are carried over unchanged unless PruneTables is set, in which case they're
-// dropped. Tables present in config but not yet live are never added here --
-// that only happens via the initial CREATE PUBLICATION.
+// dropped.
 func (c *Publication) ApplyPublicationFilters(ctx context.Context) error {
-	if !c.cfg.PruneTables && !hasConfiguredFilter(c.cfg.Tables) {
+	if len(c.cfg.Tables) == 0 {
 		return nil
 	}
 
@@ -49,27 +51,22 @@ func (c *Publication) ApplyPublicationFilters(ctx context.Context) error {
 	return nil
 }
 
-func hasConfiguredFilter(tables Tables) bool {
-	for _, t := range tables {
-		if t.PublicationFilter != "" {
-			return true
-		}
-	}
-	return false
-}
-
 // mergeDesiredPublicationTables overlays configured filters onto the live
-// table set and, if pruneTables is set, drops live tables missing from
-// configured. Reports whether the result differs from actual.
+// table set, adds configured tables missing from the live set, and, if
+// pruneTables is set, drops live tables missing from configured. Reports
+// whether the result differs from actual.
 func mergeDesiredPublicationTables(actual, configured Tables, pruneTables bool) (Tables, bool) {
 	configuredMap := make(map[string]Table, len(configured))
 	for _, t := range configured {
 		configuredMap[t.Schema+"."+t.Name] = t
 	}
+	actualKeys := make(map[string]struct{}, len(actual))
 
 	changed := false
-	desired := make(Tables, 0, len(actual))
+	desired := make(Tables, 0, len(actual)+len(configured))
 	for _, t := range actual {
+		actualKeys[t.Schema+"."+t.Name] = struct{}{}
+
 		cfgTable, ok := configuredMap[t.Schema+"."+t.Name]
 		if !ok {
 			if pruneTables {
@@ -95,6 +92,20 @@ func mergeDesiredPublicationTables(actual, configured Tables, pruneTables bool) 
 		}
 		t.PublicationFilter = resolvedFilter
 		desired = append(desired, t)
+	}
+
+	// Configured tables that aren't live yet: add them. SET TABLE replaces
+	// the whole list, so including a brand new table here is enough for
+	// Postgres to add it -- no separate ADD TABLE statement needed.
+	for _, t := range configured {
+		if _, ok := actualKeys[t.Schema+"."+t.Name]; ok {
+			continue
+		}
+		if t.PublicationFilter == ClearPublicationFilter {
+			t.PublicationFilter = ""
+		}
+		desired = append(desired, t)
+		changed = true
 	}
 
 	return desired, changed
