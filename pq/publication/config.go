@@ -13,7 +13,13 @@ type Config struct {
 	Operations        Operations `json:"operations" yaml:"operations"`
 	Tables            Tables     `json:"tables" yaml:"tables"`
 	CreateIfNotExists bool       `json:"createIfNotExists" yaml:"createIfNotExists"`
-	AllTables         bool       `json:"-" yaml:"-"`
+	// PruneTables, when true, treats Tables as the full authoritative table
+	// membership for this publication: any live publication member missing
+	// from Tables is removed via ALTER PUBLICATION ... SET TABLE. Tables
+	// present in config but not yet live are NOT added automatically -- this
+	// only removes/updates members already in the publication.
+	PruneTables bool `json:"pruneTables,omitempty" yaml:"pruneTables,omitempty"`
+	AllTables   bool `json:"-" yaml:"-"`
 }
 
 func (c Config) Validate() error {
@@ -39,25 +45,46 @@ func (c Config) Validate() error {
 
 func (c Config) createQuery() string {
 	sqlStatement := fmt.Sprintf(`CREATE PUBLICATION %s`, pq.QuoteIdentifier(c.Name))
-	var hasPartitionedTable bool
 
-	quotedTables := make([]string, len(c.Tables))
-	for i, table := range c.Tables {
-		if table.Partitioned {
-			hasPartitionedTable = true
-		}
-
-		if len(table.Columns) > 0 {
-			quotedTables[i] = fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(table.Schema), pq.QuoteIdentifier(table.Name), strings.Join(table.Columns, ", "))
-		} else {
-			quotedTables[i] = fmt.Sprintf("%s.%s", pq.QuoteIdentifier(table.Schema), pq.QuoteIdentifier(table.Name))
-		}
-	}
-	sqlStatement += " FOR TABLE " + strings.Join(quotedTables, ", ")
-
-	sqlStatement += fmt.Sprintf(" WITH (publish = '%s', publish_via_partition_root = %t)", c.Operations.String(), hasPartitionedTable)
+	sqlStatement += " FOR TABLE " + strings.Join(tableClauses(c.Tables), ", ")
+	sqlStatement += fmt.Sprintf(" WITH (publish = '%s', publish_via_partition_root = %t)", c.Operations.String(), hasPartitionedTable(c.Tables))
 
 	return sqlStatement
+}
+
+// setTableQuery rebuilds the publication's full table membership (columns and
+// row filters) via ALTER PUBLICATION ... SET TABLE. Per Postgres docs, SET TABLE
+// replaces the ENTIRE table list of the publication, so tables must include
+// every table that should remain published, not just the ones whose filter
+// changed.
+func (c Config) setTableQuery(tables Tables) string {
+	return fmt.Sprintf("ALTER PUBLICATION %s SET TABLE %s", pq.QuoteIdentifier(c.Name), strings.Join(tableClauses(tables), ", "))
+}
+
+// tableClauses renders each table's `schema.table [(cols)] [WHERE (filter)]`
+// clause, shared by CREATE PUBLICATION ... FOR TABLE and ALTER PUBLICATION ... SET TABLE.
+func tableClauses(tables Tables) []string {
+	clauses := make([]string, len(tables))
+	for i, table := range tables {
+		clause := fmt.Sprintf("%s.%s", pq.QuoteIdentifier(table.Schema), pq.QuoteIdentifier(table.Name))
+		if len(table.Columns) > 0 {
+			clause += fmt.Sprintf("(%s)", strings.Join(table.Columns, ", "))
+		}
+		if filter := table.PublicationFilter; filter != "" && filter != ClearPublicationFilter {
+			clause += fmt.Sprintf(" WHERE (%s)", filter)
+		}
+		clauses[i] = clause
+	}
+	return clauses
+}
+
+func hasPartitionedTable(tables Tables) bool {
+	for _, table := range tables {
+		if table.Partitioned {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Config) infoQuery() string {

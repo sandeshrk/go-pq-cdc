@@ -100,6 +100,74 @@ func TestTablesDiffReplicaIdentityIndex(t *testing.T) {
 	})
 }
 
+func TestTableValidatePublicationFilter(t *testing.T) {
+	t.Run("should allow a valid publication filter", func(t *testing.T) {
+		table := Table{
+			Name:              "books",
+			Schema:            "public",
+			ReplicaIdentity:   ReplicaIdentityDefault,
+			PublicationFilter: "status = 'active'",
+		}
+
+		require.NoError(t, table.Validate())
+	})
+
+	t.Run("should reject publication filter with replica identity NOTHING", func(t *testing.T) {
+		table := Table{
+			Name:              "books",
+			Schema:            "public",
+			ReplicaIdentity:   ReplicaIdentityNothing,
+			PublicationFilter: "status = 'active'",
+		}
+
+		err := table.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "publicationFilter")
+	})
+
+	t.Run("should reject unsafe publication filter", func(t *testing.T) {
+		table := Table{
+			Name:              "books",
+			Schema:            "public",
+			ReplicaIdentity:   ReplicaIdentityDefault,
+			PublicationFilter: "1=1; DROP TABLE users",
+		}
+
+		err := table.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "publicationFilter")
+	})
+
+	t.Run("should allow ClearPublicationFilter sentinel even with replica identity NOTHING", func(t *testing.T) {
+		table := Table{
+			Name:              "books",
+			Schema:            "public",
+			ReplicaIdentity:   ReplicaIdentityNothing,
+			PublicationFilter: ClearPublicationFilter,
+		}
+
+		require.NoError(t, table.Validate())
+	})
+}
+
+func TestTablesDiffPublicationFilter(t *testing.T) {
+	current := Tables{{Name: "books", Schema: "public", PublicationFilter: "status = 'active'"}}
+
+	t.Run("should include table when filter changes", func(t *testing.T) {
+		desired := Tables{{Name: "books", Schema: "public", PublicationFilter: "status = 'inactive'"}}
+
+		diff := desired.Diff(current)
+		require.Len(t, diff, 1)
+	})
+
+	t.Run("should not include table when filter is unchanged", func(t *testing.T) {
+		desired := Tables{{Name: "books", Schema: "public", PublicationFilter: "status = 'active'"}}
+
+		diff := desired.Diff(current)
+		require.Empty(t, diff)
+	})
+}
+
 func TestTablesContains(t *testing.T) {
 	tables := Tables{
 		{Name: "users", Schema: "public"},
