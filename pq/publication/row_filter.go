@@ -101,16 +101,28 @@ func mergeDesiredPublicationTables(actual, configured Tables, pruneTables bool) 
 }
 
 // GetPublicationTables returns the publication's full, live table membership
-// (schema, name, published columns, row filter) from pg_publication_tables.
+// (schema, name, published columns, row filter). Queries pg_publication_rel
+// directly rather than the pg_publication_tables convenience view: the view's
+// attnames always resolves to the full column list even when no explicit
+// column list was configured, which would round-trip back out as an explicit
+// list on SET TABLE -- and Postgres rejects an explicit column list (even one
+// naming every column) combined with REPLICA IDENTITY FULL.
 func (c *Publication) GetPublicationTables(ctx context.Context) (Tables, error) {
 	query := fmt.Sprintf(`
 		SELECT
-			schemaname AS schema_name,
-			tablename AS table_name,
-			attnames AS columns,
-			rowfilter AS row_filter
-		FROM pg_publication_tables
-		WHERE pubname = %s
+			n.nspname AS schema_name,
+			c.relname AS table_name,
+			CASE WHEN pr.prattrs IS NOT NULL THEN (
+				SELECT array_agg(a.attname ORDER BY a.attnum)
+				FROM pg_attribute a
+				WHERE a.attrelid = pr.prrelid AND a.attnum = ANY(pr.prattrs)
+			) END AS columns,
+			pg_get_expr(pr.prqual, pr.prrelid) AS row_filter
+		FROM pg_publication_rel pr
+		JOIN pg_class c ON c.oid = pr.prrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_publication p ON p.oid = pr.prpubid
+		WHERE p.pubname = %s
 	`, pq.QuoteLiteral(c.cfg.Name))
 
 	logger.Debug("executing query: ", query)
