@@ -247,11 +247,15 @@ func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb
 //   failure is logged as Error with a manual-action hint and does not stop startup.
 //   See #158 for rationale.
 //
-// A freshly created publication already has its row filters embedded in
-// CREATE PUBLICATION, so ApplyPublicationFilters is skipped there -- Postgres
-// re-serializes filter expressions (e.g. adds parens/casts), so comparing our
-// raw config string against the just-created live filter would always look
-// "different" and trigger a redundant, immediately-following SET TABLE.
+// A freshly created publication already has all of its tables and row
+// filters embedded directly in CREATE PUBLICATION, so ApplyPublicationFilters
+// is skipped there -- Postgres re-serializes filter expressions (e.g. adds
+// parens/casts), so comparing our raw config string against the just-created
+// live filter would always look "different" and trigger a redundant,
+// immediately-following SET TABLE. For an already-existing publication,
+// ApplyPublicationFilters also adds any table present in config but not yet
+// live, so config.Publication.Tables changes take effect without dropping
+// and recreating the publication.
 func initializePublication(ctx context.Context, cfg config.Config, conn pq.Connection) (*publication.Config, error) {
 	pub := publication.New(cfg.Publication, conn)
 	if cfg.Publication.CreateIfNotExists {
