@@ -41,6 +41,13 @@ type Table struct {
 	SnapshotPartitionStrategy SnapshotPartitionStrategy `json:"snapshotPartitionStrategy,omitempty" yaml:"snapshotPartitionStrategy,omitempty"`
 	QueryCondition            string                    `json:"queryCondition,omitempty" yaml:"queryCondition,omitempty"`
 	Columns                   []string                  `json:"columns,omitempty" yaml:"columns,omitempty"`
+	// PublicationFilter is a native Postgres publication row filter (CREATE/ALTER
+	// PUBLICATION ... WHERE (...), PG 15+): rows for which it evaluates false/null
+	// are never sent over the replication stream. Unlike QueryCondition, this
+	// DOES affect CDC, not just the initial snapshot. Set to ClearPublicationFilter
+	// to remove an existing live filter (plain "" means "not configured, leave
+	// the live filter alone", not "clear it").
+	PublicationFilter string `json:"publicationFilter,omitempty" yaml:"publicationFilter,omitempty"`
 	// Boolean flag to indicate if the table is partitioned, used for creating the publication on the root table.
 	Partitioned bool `json:"partitioned,omitempty" yaml:"partitioned,omitempty"`
 }
@@ -72,8 +79,25 @@ func (tc Table) Validate() error {
 		}
 	}
 
+	if tc.PublicationFilter != "" && tc.PublicationFilter != ClearPublicationFilter {
+		if err := ValidateQueryCondition(tc.PublicationFilter); err != nil {
+			return errors.Wrap(err, "publicationFilter")
+		}
+		// NOTHING never exposes old-row values, which Postgres needs to evaluate
+		// the filter on UPDATE/DELETE.
+		if tc.ReplicaIdentity == ReplicaIdentityNothing {
+			return errors.New("cannot specify publicationFilter when replicaIdentity is NOTHING")
+		}
+	}
+
 	return nil
 }
+
+// ClearPublicationFilter, set as Table.PublicationFilter, removes an existing
+// live publication row filter. Needed because the zero value "" already means
+// "not configured, leave the live filter alone" -- an explicit sentinel is the
+// only way to distinguish "no opinion" from "remove it".
+const ClearPublicationFilter = "-"
 
 type Tables []Table
 
@@ -118,7 +142,7 @@ func (ts Tables) Diff(tss Tables) Tables {
 	}
 
 	for _, t := range ts {
-		if v, found := tssMap[t.Schema+"."+t.Name]; !found || v.ReplicaIdentity != t.ReplicaIdentity || v.ReplicaIdentityIndex != t.ReplicaIdentityIndex || !slices.Equal(v.Columns, t.Columns) || v.Partitioned != t.Partitioned {
+		if v, found := tssMap[t.Schema+"."+t.Name]; !found || v.ReplicaIdentity != t.ReplicaIdentity || v.ReplicaIdentityIndex != t.ReplicaIdentityIndex || !slices.Equal(v.Columns, t.Columns) || v.Partitioned != t.Partitioned || v.PublicationFilter != t.PublicationFilter {
 			res = append(res, t)
 		}
 	}

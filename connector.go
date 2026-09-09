@@ -246,6 +246,12 @@ func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb
 // - When CreateIfNotExists is false: CheckReplicaIdentities is read-only; any
 //   failure is logged as Error with a manual-action hint and does not stop startup.
 //   See #158 for rationale.
+//
+// A freshly created publication already has its row filters embedded in
+// CREATE PUBLICATION, so ApplyPublicationFilters is skipped there -- Postgres
+// re-serializes filter expressions (e.g. adds parens/casts), so comparing our
+// raw config string against the just-created live filter would always look
+// "different" and trigger a redundant, immediately-following SET TABLE.
 func initializePublication(ctx context.Context, cfg config.Config, conn pq.Connection) (*publication.Config, error) {
 	pub := publication.New(cfg.Publication, conn)
 	if cfg.Publication.CreateIfNotExists {
@@ -255,7 +261,19 @@ func initializePublication(ctx context.Context, cfg config.Config, conn pq.Conne
 	} else if err := pub.CheckReplicaIdentities(ctx); err != nil {
 		logger.Error("replica identity check failed; take manual action to ALTER TABLE ... REPLICA IDENTITY to match the config", "error", err)
 	}
-	return pub.Create(ctx)
+	_, infoErr := pub.Info(ctx)
+	publicationAlreadyExisted := infoErr == nil
+
+	publicationInfo, err := pub.Create(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if publicationAlreadyExisted {
+		if err := pub.ApplyPublicationFilters(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return publicationInfo, nil
 }
 
 // initializeSnapshot creates snapshot if enabled
