@@ -238,6 +238,94 @@ func TestApplyPublicationFiltersReconciliation(t *testing.T) {
 	})
 }
 
+// TestApplyPublicationFiltersPreservesUntouchedTables verifies that
+// reconciling one table's filter never disturbs a second, already-filtered
+// table in the same publication -- whether that second table is explicitly
+// configured with no filter opinion, or missing from config entirely
+// (PruneTables false).
+func TestApplyPublicationFiltersPreservesUntouchedTables(t *testing.T) {
+	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	postgresConn, err := newPostgresConn()
+	require.NoError(t, err)
+	defer postgresConn.Close(ctx)
+
+	pubName := "pub_row_filter_preserve"
+
+	require.NoError(t, pgExec(ctx, postgresConn, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", pubName)))
+	require.NoError(t, pgExec(ctx, postgresConn, `
+		DROP TABLE IF EXISTS row_filter_preserve_a, row_filter_preserve_b;
+		CREATE TABLE row_filter_preserve_a (id SERIAL PRIMARY KEY, status TEXT NOT NULL);
+		CREATE TABLE row_filter_preserve_b (id SERIAL PRIMARY KEY, status TEXT NOT NULL);
+		ALTER TABLE row_filter_preserve_a REPLICA IDENTITY FULL;
+		ALTER TABLE row_filter_preserve_b REPLICA IDENTITY FULL;
+	`))
+
+	t.Cleanup(func() {
+		_ = pgExec(ctx, postgresConn, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", pubName))
+		_ = pgExec(ctx, postgresConn, "DROP TABLE IF EXISTS row_filter_preserve_a, row_filter_preserve_b")
+	})
+
+	// Both tables start with their own filter, set at CREATE time.
+	baseCfg := publication.Config{
+		Name:              pubName,
+		CreateIfNotExists: true,
+		Operations:        publication.Operations{"INSERT", "UPDATE", "DELETE"},
+		Tables: publication.Tables{
+			{Name: "row_filter_preserve_a", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull, PublicationFilter: "status = 'a-initial'"},
+			{Name: "row_filter_preserve_b", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull, PublicationFilter: "status = 'b-initial'"},
+		},
+	}
+	pub := publication.New(baseCfg, postgresConn)
+	_, err = pub.Create(ctx)
+	require.NoError(t, err)
+
+	findFilter := func(tables publication.Tables, name string) string {
+		for _, t := range tables {
+			if t.Name == name {
+				return t.PublicationFilter
+			}
+		}
+		t.Fatalf("table %s not found in publication", name)
+		return ""
+	}
+
+	t.Run("table B keeps its filter when configured with no filter opinion", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.Tables = publication.Tables{
+			{Name: "row_filter_preserve_a", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull, PublicationFilter: "status = 'a-changed'"},
+			{Name: "row_filter_preserve_b", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull}, // no PublicationFilter set
+		}
+		require.NoError(t, publication.New(cfg, postgresConn).ApplyPublicationFilters(ctx))
+
+		tables, err := pub.GetPublicationTables(ctx)
+		require.NoError(t, err)
+		require.Len(t, tables, 2)
+		assert.Contains(t, findFilter(tables, "row_filter_preserve_a"), "a-changed")
+		assert.Contains(t, findFilter(tables, "row_filter_preserve_b"), "b-initial",
+			"table B's live filter must survive a reconciliation that only touches table A")
+
+		require.NoError(t, pgExec(ctx, postgresConn, "INSERT INTO row_filter_preserve_b(status) VALUES ('b-initial')"))
+		require.NoError(t, pgExec(ctx, postgresConn, "UPDATE row_filter_preserve_b SET status = 'b-initial' WHERE status = 'b-initial'"))
+	})
+
+	t.Run("table B keeps its filter when omitted from config entirely (PruneTables false)", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.Tables = publication.Tables{
+			{Name: "row_filter_preserve_a", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull, PublicationFilter: "status = 'a-changed-again'"},
+			// row_filter_preserve_b not mentioned at all
+		}
+		require.NoError(t, publication.New(cfg, postgresConn).ApplyPublicationFilters(ctx))
+
+		tables, err := pub.GetPublicationTables(ctx)
+		require.NoError(t, err)
+		require.Len(t, tables, 2, "table B must still be a publication member")
+		assert.Contains(t, findFilter(tables, "row_filter_preserve_a"), "a-changed-again")
+		assert.Contains(t, findFilter(tables, "row_filter_preserve_b"), "b-initial")
+	})
+}
+
 // TestApplyPublicationFiltersPruneTables verifies that PruneTables drops a
 // live publication member that's missing from config, via the same SET TABLE
 // reconciliation, while leaving still-configured tables untouched.
