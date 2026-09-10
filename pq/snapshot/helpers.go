@@ -13,6 +13,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
+	libpq "github.com/lib/pq"
 )
 
 // Time format constants for PostgreSQL timestamp formatting
@@ -199,7 +200,20 @@ func parseNullableInt64(value []byte) (*int64, error) {
 // helper function to format column list for snapshot queries
 func selectSnapshotColumns(columns []string) string {
 	if len(columns) > 0 {
-		return strings.Join(columns, ", ")
+		quoted := make([]string, len(columns))
+		for i, column := range columns {
+			quoted[i] = libpq.QuoteIdentifier(column)
+		}
+		return strings.Join(quoted, ", ")
 	}
 	return "*"
+}
+
+// quoteQualifiedTable double-quotes schema and table independently for use
+// as a PostgreSQL qualified table reference, so a table name containing a
+// literal dot (e.g. a value-type child table's generated name) is not
+// mistaken for a schema separator, and an embedded quote in either part is
+// escaped rather than breaking the generated SQL.
+func quoteQualifiedTable(schema, table string) string {
+	return libpq.QuoteIdentifier(schema) + "." + libpq.QuoteIdentifier(table)
 }
