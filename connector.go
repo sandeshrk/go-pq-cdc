@@ -551,7 +551,7 @@ func (c *connector) executeSnapshotOnly(ctx context.Context) error {
 	// Execute snapshot (collect data from all chunks)
 	// Note: We call Execute directly with the slotName we prepared with,
 	// not through executeSnapshotWithRetry which uses c.cfg.Slot.Name
-	if err := c.snapshotter.Execute(ctx, c.snapshotHandler, slotName); err != nil {
+	if err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), slotName); err != nil {
 		return errors.Wrap(err, "execute snapshot")
 	}
 
@@ -612,7 +612,7 @@ func (c *connector) executeSnapshotWithRetry(ctx context.Context) error {
 	retryDelay := initialDelay
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err := c.snapshotter.Execute(ctx, c.snapshotHandler, c.cfg.Slot.Name)
+		err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), c.cfg.Slot.Name)
 		if err == nil {
 			return nil // Success
 		}
@@ -714,17 +714,24 @@ func (c *connector) retryOperation(operationName string, maxRetries int, operati
 	return errors.Wrapf(lastErr, "%s failed after %d retries", operationName, maxRetries)
 }
 
-func (c *connector) snapshotHandler(event *format.Snapshot) error {
-	c.listenerFunc(&replication.ListenerContext{
-		Message: event,
-		Ack: func() error {
-			return nil // ACK isn't required for snapshot
-		},
-		AckLSN: func(pq.LSN) error {
-			return nil // ACK isn't required for snapshot
-		},
-	})
-	return nil
+// snapshotHandlerFor returns a snapshot.Handler bound to ctx, since
+// snapshot.Handler itself carries no context parameter. Without this, a
+// listener reading ListenerContext.Context off a snapshot event sees nil
+// instead of a real context, unlike every live-replication event.
+func (c *connector) snapshotHandlerFor(ctx context.Context) snapshot.Handler {
+	return func(event *format.Snapshot) error {
+		c.listenerFunc(&replication.ListenerContext{
+			Context: ctx,
+			Message: event,
+			Ack: func() error {
+				return nil // ACK isn't required for snapshot
+			},
+			AckLSN: func(pq.LSN) error {
+				return nil // ACK isn't required for snapshot
+			},
+		})
+		return nil
+	}
 }
 
 func (c *connector) WaitUntilReady(ctx context.Context) error {
