@@ -14,6 +14,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/go-playground/errors"
+	libpq "github.com/lib/pq"
 )
 
 type primaryKeyColumn struct {
@@ -505,15 +506,14 @@ func (s *Snapshotter) buildChunkQuery(chunk *Chunk, orderByClause string, pkColu
 
 func (s *Snapshotter) buildIntegerRangeQuery(chunk *Chunk, orderByClause string, pkColumns []string, queryCondition string) string {
 	if chunk.hasRangeBounds() && len(pkColumns) == 1 {
-		pkColumn := pkColumns[0]
+		pkColumn := libpq.QuoteIdentifier(pkColumns[0])
 		cols := selectSnapshotColumns(chunk.TableColumns)
 		whereClause := fmt.Sprintf("%s >= %d AND %s <= %d", pkColumn, *chunk.RangeStart, pkColumn, *chunk.RangeEnd)
 		whereClause = andCondition(whereClause, queryCondition)
 		return fmt.Sprintf(
-			`SELECT %s FROM "%s"."%s" WHERE %s ORDER BY %s LIMIT %d`,
+			`SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d`,
 			cols,
-			chunk.TableSchema,
-			chunk.TableName,
+			quoteQualifiedTable(chunk.TableSchema, chunk.TableName),
 			whereClause,
 			orderByClause,
 			chunk.ChunkSize,
@@ -527,10 +527,11 @@ func (s *Snapshotter) buildCTIDBlockQuery(chunk *Chunk, queryCondition string) s
 	cols := selectSnapshotColumns(chunk.TableColumns)
 	// Empty table or single chunk without block info - select all
 	if chunk.BlockStart == nil {
+		table := quoteQualifiedTable(chunk.TableSchema, chunk.TableName)
 		if queryCondition != "" {
-			return fmt.Sprintf(`SELECT %s FROM "%s"."%s" WHERE (%s)`, cols, chunk.TableSchema, chunk.TableName, queryCondition)
+			return fmt.Sprintf(`SELECT %s FROM %s WHERE (%s)`, cols, table, queryCondition)
 		}
-		return fmt.Sprintf(`SELECT %s FROM "%s"."%s"`, cols, chunk.TableSchema, chunk.TableName)
+		return fmt.Sprintf(`SELECT %s FROM %s`, cols, table)
 	}
 
 	// Last chunk (BlockEnd is nil): no upper bound to catch rows added after metadata creation
@@ -539,8 +540,8 @@ func (s *Snapshotter) buildCTIDBlockQuery(chunk *Chunk, queryCondition string) s
 		whereClause := fmt.Sprintf("ctid >= '(%d,0)'::tid", *chunk.BlockStart)
 		whereClause = andCondition(whereClause, queryCondition)
 		return fmt.Sprintf(
-			`SELECT %s FROM "%s"."%s" WHERE %s`,
-			cols, chunk.TableSchema, chunk.TableName, whereClause,
+			`SELECT %s FROM %s WHERE %s`,
+			cols, quoteQualifiedTable(chunk.TableSchema, chunk.TableName), whereClause,
 		)
 	}
 
@@ -549,10 +550,9 @@ func (s *Snapshotter) buildCTIDBlockQuery(chunk *Chunk, queryCondition string) s
 	whereClause := fmt.Sprintf("ctid >= '(%d,0)'::tid AND ctid < '(%d,0)'::tid", *chunk.BlockStart, *chunk.BlockEnd)
 	whereClause = andCondition(whereClause, queryCondition)
 	return fmt.Sprintf(
-		`SELECT %s FROM "%s"."%s" WHERE %s`,
+		`SELECT %s FROM %s WHERE %s`,
 		cols,
-		chunk.TableSchema,
-		chunk.TableName,
+		quoteQualifiedTable(chunk.TableSchema, chunk.TableName),
 		whereClause,
 	)
 }
@@ -564,10 +564,9 @@ func (s *Snapshotter) buildOffsetQuery(chunk *Chunk, orderByClause string, query
 		where = " WHERE (" + queryCondition + ")"
 	}
 	return fmt.Sprintf(
-		`SELECT %s FROM "%s"."%s"%s ORDER BY %s LIMIT %d OFFSET %d`,
+		`SELECT %s FROM %s%s ORDER BY %s LIMIT %d OFFSET %d`,
 		cols,
-		chunk.TableSchema,
-		chunk.TableName,
+		quoteQualifiedTable(chunk.TableSchema, chunk.TableName),
 		where,
 		orderByClause,
 		chunk.ChunkSize,
@@ -588,10 +587,12 @@ func (s *Snapshotter) getOrderByClause(ctx context.Context, conn pq.Connection, 
 
 	if len(columns) > 0 {
 		var columnNames []string
+		var quotedNames []string
 		for _, column := range columns {
 			columnNames = append(columnNames, column.Name)
+			quotedNames = append(quotedNames, libpq.QuoteIdentifier(column.Name))
 		}
-		orderBy := strings.Join(columnNames, ", ")
+		orderBy := strings.Join(quotedNames, ", ")
 		logger.Debug("[chunk] using primary key for ordering", "table", table.Name, "orderBy", orderBy)
 		s.storeOrderByCache(table, orderBy, columnNames)
 		return orderBy, columnNames, nil
@@ -839,8 +840,8 @@ func (s *Snapshotter) createCTIDBlockChunksWithConn(ctx context.Context, conn pq
 	// Get total blocks in table using the provided connection
 	// When using snapshot connection, this sees the same data that workers will process
 	query := fmt.Sprintf(
-		`SELECT COALESCE((pg_relation_size(to_regclass('"%s"."%s"')) / current_setting('block_size')::int)::bigint, 0)`,
-		table.Schema, table.Name,
+		`SELECT COALESCE((pg_relation_size(to_regclass('%s')) / current_setting('block_size')::int)::bigint, 0)`,
+		quoteQualifiedTable(table.Schema, table.Name),
 	)
 
 	results, err := s.execQuery(ctx, conn, query)
@@ -937,8 +938,8 @@ func (s *Snapshotter) estimateRowsPerBlockWithConn(ctx context.Context, conn pq.
 			ELSE 100
 		END
 		FROM pg_class
-		WHERE oid = '"%s"."%s"'::regclass
-	`, table.Schema, table.Name)
+		WHERE oid = '%s'::regclass
+	`, quoteQualifiedTable(table.Schema, table.Name))
 
 	results, err := s.execQuery(ctx, conn, query)
 	if err != nil {
@@ -1011,9 +1012,9 @@ func (s *Snapshotter) getPrimaryKeyColumnsDetailed(ctx context.Context, conn pq.
 		SELECT a.attname, format_type(a.atttypid, a.atttypmod)
 		FROM pg_index i
 		JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-		WHERE i.indrelid = '"%s"."%s"'::regclass AND i.indisprimary
+		WHERE i.indrelid = '%s'::regclass AND i.indisprimary
 		ORDER BY a.attnum
-	`, table.Schema, table.Name)
+	`, quoteQualifiedTable(table.Schema, table.Name))
 
 	results, err := s.execQuery(ctx, conn, query)
 	if err != nil {
@@ -1064,10 +1065,11 @@ func isIntegerType(dataType string) bool {
 }
 
 func (s *Snapshotter) getPrimaryKeyBoundsWithConn(ctx context.Context, conn pq.Connection, table publication.Table, pkColumn string) (int64, int64, bool, error) {
+	quotedPKColumn := libpq.QuoteIdentifier(pkColumn)
 	query := fmt.Sprintf(`
 		SELECT MIN(%s)::bigint AS min_value, MAX(%s)::bigint AS max_value
-		FROM "%s"."%s"
-	`, pkColumn, pkColumn, table.Schema, table.Name)
+		FROM %s
+	`, quotedPKColumn, quotedPKColumn, quoteQualifiedTable(table.Schema, table.Name))
 
 	results, err := s.execQuery(ctx, conn, query)
 	if err != nil {
@@ -1224,8 +1226,8 @@ func (s *Snapshotter) buildChunkValueString(chunk *Chunk) string {
 func (s *Snapshotter) getTableRawCountWithConn(ctx context.Context, conn pq.Connection, schema, table string) (int64, error) {
 	queryCondition := s.getQueryCondition(schema, table)
 
-	// query := fmt.Sprintf("SELECT reltuples::bigint FROM pg_class WHERE oid = '%s.%s'::regclass", schema, table)
-	query := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s"`, schema, table)
+	// query := fmt.Sprintf("SELECT reltuples::bigint FROM pg_class WHERE oid = '%s'::regclass", quoteQualifiedTable(schema, table))
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteQualifiedTable(schema, table))
 	if queryCondition != "" {
 		query += " WHERE (" + queryCondition + ")"
 	}
