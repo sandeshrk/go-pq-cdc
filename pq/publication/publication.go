@@ -123,7 +123,7 @@ func decodePublicationInfoResult(result *pgconn.Result) (*Config, error) {
 	}
 
 	for _, tableName := range tables {
-		st := strings.Split(tableName, ".")
+		st := strings.SplitN(tableName, ".", 2)
 		publicationConfig.Tables = append(publicationConfig.Tables, Table{
 			Name:   st[1],
 			Schema: st[0],
