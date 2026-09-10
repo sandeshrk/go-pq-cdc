@@ -452,6 +452,7 @@ func (s *Snapshotter) processChunk(ctx context.Context, conn pq.Connection, chun
 			LSN:        lsn,
 			IsLast:     isLast,
 		})
+		logger.Debug("[chunk] handler returned", "table", chunk.TableName, "schema", chunk.TableSchema, "row", i, "isLast", isLast)
 	}
 
 	return rowCount, nil
@@ -509,7 +510,7 @@ func (s *Snapshotter) buildIntegerRangeQuery(chunk *Chunk, orderByClause string,
 		whereClause := fmt.Sprintf("%s >= %d AND %s <= %d", pkColumn, *chunk.RangeStart, pkColumn, *chunk.RangeEnd)
 		whereClause = andCondition(whereClause, queryCondition)
 		return fmt.Sprintf(
-			"SELECT %s FROM %s.%s WHERE %s ORDER BY %s LIMIT %d",
+			`SELECT %s FROM "%s"."%s" WHERE %s ORDER BY %s LIMIT %d`,
 			cols,
 			chunk.TableSchema,
 			chunk.TableName,
@@ -527,9 +528,9 @@ func (s *Snapshotter) buildCTIDBlockQuery(chunk *Chunk, queryCondition string) s
 	// Empty table or single chunk without block info - select all
 	if chunk.BlockStart == nil {
 		if queryCondition != "" {
-			return fmt.Sprintf("SELECT %s FROM %s.%s WHERE (%s)", cols, chunk.TableSchema, chunk.TableName, queryCondition)
+			return fmt.Sprintf(`SELECT %s FROM "%s"."%s" WHERE (%s)`, cols, chunk.TableSchema, chunk.TableName, queryCondition)
 		}
-		return fmt.Sprintf("SELECT %s FROM %s.%s", cols, chunk.TableSchema, chunk.TableName)
+		return fmt.Sprintf(`SELECT %s FROM "%s"."%s"`, cols, chunk.TableSchema, chunk.TableName)
 	}
 
 	// Last chunk (BlockEnd is nil): no upper bound to catch rows added after metadata creation
@@ -538,7 +539,7 @@ func (s *Snapshotter) buildCTIDBlockQuery(chunk *Chunk, queryCondition string) s
 		whereClause := fmt.Sprintf("ctid >= '(%d,0)'::tid", *chunk.BlockStart)
 		whereClause = andCondition(whereClause, queryCondition)
 		return fmt.Sprintf(
-			"SELECT %s FROM %s.%s WHERE %s",
+			`SELECT %s FROM "%s"."%s" WHERE %s`,
 			cols, chunk.TableSchema, chunk.TableName, whereClause,
 		)
 	}
@@ -548,7 +549,7 @@ func (s *Snapshotter) buildCTIDBlockQuery(chunk *Chunk, queryCondition string) s
 	whereClause := fmt.Sprintf("ctid >= '(%d,0)'::tid AND ctid < '(%d,0)'::tid", *chunk.BlockStart, *chunk.BlockEnd)
 	whereClause = andCondition(whereClause, queryCondition)
 	return fmt.Sprintf(
-		"SELECT %s FROM %s.%s WHERE %s",
+		`SELECT %s FROM "%s"."%s" WHERE %s`,
 		cols,
 		chunk.TableSchema,
 		chunk.TableName,
@@ -563,7 +564,7 @@ func (s *Snapshotter) buildOffsetQuery(chunk *Chunk, orderByClause string, query
 		where = " WHERE (" + queryCondition + ")"
 	}
 	return fmt.Sprintf(
-		"SELECT %s FROM %s.%s%s ORDER BY %s LIMIT %d OFFSET %d",
+		`SELECT %s FROM "%s"."%s"%s ORDER BY %s LIMIT %d OFFSET %d`,
 		cols,
 		chunk.TableSchema,
 		chunk.TableName,
@@ -838,7 +839,7 @@ func (s *Snapshotter) createCTIDBlockChunksWithConn(ctx context.Context, conn pq
 	// Get total blocks in table using the provided connection
 	// When using snapshot connection, this sees the same data that workers will process
 	query := fmt.Sprintf(
-		"SELECT COALESCE((pg_relation_size(to_regclass('%s.%s')) / current_setting('block_size')::int)::bigint, 0)",
+		`SELECT COALESCE((pg_relation_size(to_regclass('"%s"."%s"')) / current_setting('block_size')::int)::bigint, 0)`,
 		table.Schema, table.Name,
 	)
 
@@ -936,7 +937,7 @@ func (s *Snapshotter) estimateRowsPerBlockWithConn(ctx context.Context, conn pq.
 			ELSE 100
 		END
 		FROM pg_class
-		WHERE oid = '%s.%s'::regclass
+		WHERE oid = '"%s"."%s"'::regclass
 	`, table.Schema, table.Name)
 
 	results, err := s.execQuery(ctx, conn, query)
@@ -1010,7 +1011,7 @@ func (s *Snapshotter) getPrimaryKeyColumnsDetailed(ctx context.Context, conn pq.
 		SELECT a.attname, format_type(a.atttypid, a.atttypmod)
 		FROM pg_index i
 		JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-		WHERE i.indrelid = '%s.%s'::regclass AND i.indisprimary
+		WHERE i.indrelid = '"%s"."%s"'::regclass AND i.indisprimary
 		ORDER BY a.attnum
 	`, table.Schema, table.Name)
 
@@ -1065,7 +1066,7 @@ func isIntegerType(dataType string) bool {
 func (s *Snapshotter) getPrimaryKeyBoundsWithConn(ctx context.Context, conn pq.Connection, table publication.Table, pkColumn string) (int64, int64, bool, error) {
 	query := fmt.Sprintf(`
 		SELECT MIN(%s)::bigint AS min_value, MAX(%s)::bigint AS max_value
-		FROM %s.%s
+		FROM "%s"."%s"
 	`, pkColumn, pkColumn, table.Schema, table.Name)
 
 	results, err := s.execQuery(ctx, conn, query)
@@ -1224,7 +1225,7 @@ func (s *Snapshotter) getTableRawCountWithConn(ctx context.Context, conn pq.Conn
 	queryCondition := s.getQueryCondition(schema, table)
 
 	// query := fmt.Sprintf("SELECT reltuples::bigint FROM pg_class WHERE oid = '%s.%s'::regclass", schema, table)
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", schema, table)
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM "%s"."%s"`, schema, table)
 	if queryCondition != "" {
 		query += " WHERE (" + queryCondition + ")"
 	}
