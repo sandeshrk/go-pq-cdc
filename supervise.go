@@ -18,6 +18,15 @@ type SuperviseOpts struct {
 	// OnRetry, if set, is called before each backoff wait, in addition to the
 	// package's own logging.
 	OnRetry func(attempt int, err error, backoff time.Duration)
+	// OnReady, if set, is called once per attempt right after that attempt's
+	// connector reports WaitUntilReady success -- i.e. once the slot is
+	// captured and the replication stream is open, not merely once
+	// NewConnector returns. It is not called if the connector shuts down or
+	// fails before ever becoming ready (see ErrConnectorClosedBeforeReady).
+	// Runs on its own goroutine, concurrently with the blocking Run call; a
+	// panic inside it is recovered and logged, not propagated, but it should
+	// still not block indefinitely.
+	OnReady func()
 }
 
 func (o SuperviseOpts) withDefaults() SuperviseOpts {
@@ -52,13 +61,37 @@ func (o SuperviseOpts) withDefaults() SuperviseOpts {
 // keeps retrying with exponential backoff until ctx is cancelled.
 func Supervise(ctx context.Context, cfg config.Config, handler replication.ListenerFunc, opts SuperviseOpts) error {
 	return supervise(ctx, opts, func(ctx context.Context) error {
-		c, err := NewConnector(ctx, cfg, handler)
-		if err != nil {
-			return err
-		}
-		defer c.Close()
-		return c.Run(ctx)
+		return runAttempt(ctx, opts, func(ctx context.Context) (Connector, error) {
+			return NewConnector(ctx, cfg, handler)
+		})
 	})
+}
+
+// runAttempt drives a single attempt: build a connector, fire opts.OnReady
+// once it reports ready (if set), then block on Run until it returns. Split
+// out from Supervise so opts.OnReady's wiring can be unit-tested against a
+// fake connector factory instead of a real database.
+func runAttempt(ctx context.Context, opts SuperviseOpts, newConnector func(ctx context.Context) (Connector, error)) error {
+	c, err := newConnector(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if opts.OnReady != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("recovered panic in OnReady callback", "error", r)
+				}
+			}()
+			if err := c.WaitUntilReady(ctx); err == nil {
+				opts.OnReady()
+			}
+		}()
+	}
+
+	return c.Run(ctx)
 }
 
 // supervise is the retry/backoff engine behind Supervise, factored out so

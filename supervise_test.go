@@ -9,8 +9,118 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+// fakeSupervisedConnector is a minimal Connector fake for testing runAttempt's
+// OnReady wiring without a real database. WaitUntilReady and Run each return
+// their configured error immediately (no goroutine synchronization needed
+// since callers already run WaitUntilReady on its own goroutine).
+type fakeSupervisedConnector struct {
+	readyErr error
+	runErr   error
+	closed   atomic.Bool
+}
+
+func (f *fakeSupervisedConnector) Start(ctx context.Context)                     { _ = f.Run(ctx) }
+func (f *fakeSupervisedConnector) Run(context.Context) error                     { return f.runErr }
+func (f *fakeSupervisedConnector) WaitUntilReady(context.Context) error          { return f.readyErr }
+func (f *fakeSupervisedConnector) Close()                                        { f.closed.Store(true) }
+func (f *fakeSupervisedConnector) GetConfig() *config.Config                     { return nil }
+func (f *fakeSupervisedConnector) SetMetricCollectors(_ ...prometheus.Collector) {}
+
+var _ Connector = (*fakeSupervisedConnector)(nil)
+
+func waitForSignal(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("expected OnReady to be called")
+	}
+}
+
+func TestRunAttemptCallsOnReadyOnSuccessfulReady(t *testing.T) {
+	fc := &fakeSupervisedConnector{}
+	onReady := make(chan struct{}, 1)
+
+	err := runAttempt(context.Background(), SuperviseOpts{OnReady: func() { onReady <- struct{}{} }}, func(context.Context) (Connector, error) {
+		return fc, nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	waitForSignal(t, onReady)
+	if !fc.closed.Load() {
+		t.Fatal("expected the connector to be closed")
+	}
+}
+
+func TestRunAttemptRecoversOnReadyPanic(t *testing.T) {
+	fc := &fakeSupervisedConnector{}
+	onReadyCalled := make(chan struct{})
+
+	err := runAttempt(context.Background(), SuperviseOpts{OnReady: func() {
+		close(onReadyCalled)
+		panic("boom")
+	}}, func(context.Context) (Connector, error) {
+		return fc, nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil, a panicking OnReady must not surface as an attempt error, got %v", err)
+	}
+
+	select {
+	case <-onReadyCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected OnReady to be called")
+	}
+	// If the panic weren't recovered, it would have already crashed the
+	// whole test binary by now rather than merely failing an assertion.
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestRunAttemptDoesNotCallOnReadyWhenNeverReady(t *testing.T) {
+	fc := &fakeSupervisedConnector{
+		readyErr: ErrConnectorClosedBeforeReady,
+		runErr:   errors.New("bootstrap failed"),
+	}
+	onReady := make(chan struct{}, 1)
+
+	err := runAttempt(context.Background(), SuperviseOpts{OnReady: func() { onReady <- struct{}{} }}, func(context.Context) (Connector, error) {
+		return fc, nil
+	})
+	if err == nil {
+		t.Fatal("expected the connector's Run error back")
+	}
+	select {
+	case <-onReady:
+		t.Fatal("OnReady must not be called when the connector never became ready")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRunAttemptWithNilOnReadyDoesNotPanic(t *testing.T) {
+	fc := &fakeSupervisedConnector{}
+	err := runAttempt(context.Background(), SuperviseOpts{}, func(context.Context) (Connector, error) {
+		return fc, nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestRunAttemptPropagatesNewConnectorError(t *testing.T) {
+	wantErr := errors.New("dial failed")
+	err := runAttempt(context.Background(), SuperviseOpts{}, func(context.Context) (Connector, error) {
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the NewConnector error back, got %v", err)
+	}
+}
 
 func TestMain(m *testing.M) {
 	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
