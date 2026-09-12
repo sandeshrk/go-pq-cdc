@@ -104,11 +104,11 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			ChunkSize:         500,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "is_active = true")
-		assert.Contains(t, q, "WHERE id >= 1 AND id <= 1000 AND (is_active = true)")
+		assert.Contains(t, q, `WHERE "id" >= 1 AND "id" <= 1000 AND (is_active = true)`)
 		assert.Contains(t, q, "ORDER BY id LIMIT 500")
 	})
 
-	t.Run("integer range without condition is unchanged from legacy shape", func(t *testing.T) {
+	t.Run("integer range without condition quotes table and pk column", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "users",
@@ -118,7 +118,7 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			ChunkSize:         5,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "")
-		assert.Equal(t, "SELECT * FROM public.users WHERE id >= 1 AND id <= 10 ORDER BY id LIMIT 5", q)
+		assert.Equal(t, `SELECT * FROM "public"."users" WHERE "id" >= 1 AND "id" <= 10 ORDER BY id LIMIT 5`, q)
 	})
 
 	t.Run("offset strategy injects condition into WHERE", func(t *testing.T) {
@@ -191,7 +191,7 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			PartitionStrategy: PartitionStrategyCTIDBlock,
 		}
 		q := s.buildChunkQuery(chunk, "", nil, "tenant_id = 7")
-		assert.Contains(t, q, "FROM public.events WHERE (tenant_id = 7)")
+		assert.Contains(t, q, `FROM "public"."events" WHERE (tenant_id = 7)`)
 	})
 
 	t.Run("ctid empty table without condition has no WHERE", func(t *testing.T) {
