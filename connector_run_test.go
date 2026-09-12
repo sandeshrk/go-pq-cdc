@@ -137,3 +137,39 @@ func TestWaitForShutdownOrFatalReturnsNilOnCancel(t *testing.T) {
 		t.Fatalf("expected nil on a clean cancel, got %v", err)
 	}
 }
+
+// TestWaitUntilReadySucceedsOnGenuineReadySignal verifies WaitUntilReady
+// returns nil once run() actually signals readiness.
+func TestWaitUntilReadySucceedsOnGenuineReadySignal(t *testing.T) {
+	c := &connector{readyCh: make(chan struct{}, 1)}
+	c.ready.Store(true)
+	c.readyCh <- struct{}{}
+
+	if err := c.WaitUntilReady(context.Background()); err != nil {
+		t.Fatalf("expected nil on a genuine ready signal, got %v", err)
+	}
+}
+
+// TestWaitUntilReadyReturnsErrConnectorClosedBeforeReady verifies that a
+// Close() before the connector ever becomes ready (e.g. bootstrap failed) is
+// distinguishable from a genuine ready signal -- Close() closes readyCh to
+// unblock waiters, which a bare channel receive can't otherwise tell apart
+// from an actual send.
+func TestWaitUntilReadyReturnsErrConnectorClosedBeforeReady(t *testing.T) {
+	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	registry := metric.NewRegistry(metric.NewMetric("test_wait_ready_closed"))
+	c := &connector{
+		fatalCh:  make(chan error, 1),
+		cancelCh: make(chan os.Signal, 1),
+		readyCh:  make(chan struct{}, 1),
+		server:   http.NewServer(config.Config{Metric: config.MetricConfig{Port: 0}}, registry, nil),
+	}
+
+	c.Close() // simulates a connector torn down before ever becoming ready
+
+	err := c.WaitUntilReady(context.Background())
+	if !errors.Is(err, ErrConnectorClosedBeforeReady) {
+		t.Fatalf("expected ErrConnectorClosedBeforeReady, got %v", err)
+	}
+}

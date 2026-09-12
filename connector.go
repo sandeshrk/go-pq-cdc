@@ -65,6 +65,11 @@ type connector struct {
 	slot               *slot.Slot
 	cancelCh           chan os.Signal
 	readyCh            chan struct{}
+	// ready is set right before readyCh is signaled, so WaitUntilReady can
+	// tell a genuine ready signal apart from Close() unblocking waiters on a
+	// connector that shut down before ever becoming ready (Close also closes
+	// readyCh, which a bare channel receive cannot distinguish from a real send).
+	ready atomic.Bool
 	// fatalCh receives a recovered panic from any of the connector's
 	// background goroutines (see runGuarded), so Run can report it instead of
 	// the whole process crashing invisibly to the caller.
@@ -401,6 +406,7 @@ func (c *connector) run(ctx context.Context) error {
 
 	signal.Notify(c.cancelCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGABRT, syscall.SIGQUIT)
 
+	c.ready.Store(true)
 	c.readyCh <- struct{}{}
 
 	return c.waitForShutdownOrFatal(ctx)
@@ -734,10 +740,20 @@ func (c *connector) snapshotHandlerFor(ctx context.Context) snapshot.Handler {
 	}
 }
 
+// ErrConnectorClosedBeforeReady is returned by WaitUntilReady when the
+// connector is Close()d (or fails and is torn down) before it ever finished
+// bootstrapping. Close() closes readyCh to unblock any in-flight
+// WaitUntilReady callers rather than leaving them stuck forever; this
+// sentinel lets callers tell that apart from a genuine ready signal.
+var ErrConnectorClosedBeforeReady = goerrors.New("connector closed before becoming ready")
+
 func (c *connector) WaitUntilReady(ctx context.Context) error {
 	select {
 	case <-c.readyCh:
-		return nil
+		if c.ready.Load() {
+			return nil
+		}
+		return ErrConnectorClosedBeforeReady
 	case <-ctx.Done():
 		return ctx.Err()
 	}
