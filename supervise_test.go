@@ -58,6 +58,30 @@ func TestRunAttemptCallsOnReadyOnSuccessfulReady(t *testing.T) {
 	}
 }
 
+func TestRunAttemptRecoversOnReadyPanic(t *testing.T) {
+	fc := &fakeSupervisedConnector{}
+	onReadyCalled := make(chan struct{})
+
+	err := runAttempt(context.Background(), SuperviseOpts{OnReady: func() {
+		close(onReadyCalled)
+		panic("boom")
+	}}, func(context.Context) (Connector, error) {
+		return fc, nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil, a panicking OnReady must not surface as an attempt error, got %v", err)
+	}
+
+	select {
+	case <-onReadyCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected OnReady to be called")
+	}
+	// If the panic weren't recovered, it would have already crashed the
+	// whole test binary by now rather than merely failing an assertion.
+	time.Sleep(50 * time.Millisecond)
+}
+
 func TestRunAttemptDoesNotCallOnReadyWhenNeverReady(t *testing.T) {
 	fc := &fakeSupervisedConnector{
 		readyErr: ErrConnectorClosedBeforeReady,

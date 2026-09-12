@@ -50,6 +50,11 @@ type Connector interface {
 	// second call returns ErrConnectorConsumed immediately. Build a new
 	// connector to retry.
 	Run(ctx context.Context) error
+	// WaitUntilReady blocks until the connector finishes bootstrapping
+	// (slot captured, replication stream open) or ctx is done. If the
+	// connector is closed or fails before ever becoming ready, it returns
+	// ErrConnectorClosedBeforeReady, distinguishable via errors.Is from a
+	// plain ctx.Err().
 	WaitUntilReady(ctx context.Context) error
 	Close()
 	GetConfig() *config.Config

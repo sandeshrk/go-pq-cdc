@@ -23,8 +23,9 @@ type SuperviseOpts struct {
 	// captured and the replication stream is open, not merely once
 	// NewConnector returns. It is not called if the connector shuts down or
 	// fails before ever becoming ready (see ErrConnectorClosedBeforeReady).
-	// Runs on its own goroutine, concurrently with the blocking Run call, so
-	// it must not block or panic.
+	// Runs on its own goroutine, concurrently with the blocking Run call; a
+	// panic inside it is recovered and logged, not propagated, but it should
+	// still not block indefinitely.
 	OnReady func()
 }
 
@@ -79,6 +80,11 @@ func runAttempt(ctx context.Context, opts SuperviseOpts, newConnector func(ctx c
 
 	if opts.OnReady != nil {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("recovered panic in OnReady callback", "error", r)
+				}
+			}()
 			if err := c.WaitUntilReady(ctx); err == nil {
 				opts.OnReady()
 			}
