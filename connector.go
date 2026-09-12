@@ -69,12 +69,18 @@ type connector struct {
 	timescaleDB        *timescaledb.TimescaleDB
 	slot               *slot.Slot
 	cancelCh           chan os.Signal
-	readyCh            chan struct{}
-	// ready is set right before readyCh is signaled, so WaitUntilReady can
-	// tell a genuine ready signal apart from Close() unblocking waiters on a
-	// connector that shut down before ever becoming ready (Close also closes
-	// readyCh, which a bare channel receive cannot distinguish from a real send).
-	ready atomic.Bool
+	// readyCh is closed exactly once, only by run() itself, right after
+	// bootstrap succeeds (slot captured, stream open) -- never sent to, and
+	// never closed by Close(). Only the sender of a channel should close it;
+	// having Close() also close readyCh would race run()'s close on a
+	// connector Close()d concurrently with an in-flight bootstrap, causing a
+	// "close of closed channel" (or, with the old send-based signal, "send on
+	// closed channel") panic.
+	readyCh chan struct{}
+	// closedCh is closed exactly once, only by Close() (guarded by
+	// closeOnce), so WaitUntilReady can unblock on a connector torn down
+	// before it ever became ready without touching readyCh.
+	closedCh chan struct{}
 	// fatalCh receives a recovered panic from any of the connector's
 	// background goroutines (see runGuarded), so Run can report it instead of
 	// the whole process crashing invisibly to the caller.
@@ -175,7 +181,8 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 		snapshotter:        snapshotter,
 		listenerFunc:       listenerFunc,
 		cancelCh:           make(chan os.Signal, 1),
-		readyCh:            make(chan struct{}, 1),
+		readyCh:            make(chan struct{}),
+		closedCh:           make(chan struct{}),
 		fatalCh:            make(chan error, 4),
 	}, nil
 }
@@ -209,7 +216,8 @@ func newSnapshotOnlyConnector(ctx context.Context, cfg config.Config, listenerFu
 		snapshotter:        snapshotter,
 		listenerFunc:       listenerFunc,
 		cancelCh:           make(chan os.Signal, 1),
-		readyCh:            make(chan struct{}, 1),
+		readyCh:            make(chan struct{}),
+		closedCh:           make(chan struct{}),
 		fatalCh:            make(chan error, 4),
 		// CDC components left nil: system, stream, slot
 	}, nil
@@ -411,8 +419,7 @@ func (c *connector) run(ctx context.Context) error {
 
 	signal.Notify(c.cancelCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGABRT, syscall.SIGQUIT)
 
-	c.ready.Store(true)
-	c.readyCh <- struct{}{}
+	close(c.readyCh)
 
 	return c.waitForShutdownOrFatal(ctx)
 }
@@ -747,17 +754,25 @@ func (c *connector) snapshotHandlerFor(ctx context.Context) snapshot.Handler {
 
 // ErrConnectorClosedBeforeReady is returned by WaitUntilReady when the
 // connector is Close()d (or fails and is torn down) before it ever finished
-// bootstrapping. Close() closes readyCh to unblock any in-flight
-// WaitUntilReady callers rather than leaving them stuck forever; this
-// sentinel lets callers tell that apart from a genuine ready signal.
+// bootstrapping -- Close() closes a dedicated closedCh to unblock any
+// in-flight WaitUntilReady callers rather than leaving them stuck forever;
+// this sentinel lets callers tell that apart from a genuine ready signal.
 var ErrConnectorClosedBeforeReady = goerrors.New("connector closed before becoming ready")
 
 func (c *connector) WaitUntilReady(ctx context.Context) error {
+	// A non-blocking check first so a genuine ready signal always wins even
+	// if closedCh has also since been closed (e.g. a normal shutdown after a
+	// successful bootstrap).
 	select {
 	case <-c.readyCh:
-		if c.ready.Load() {
-			return nil
-		}
+		return nil
+	default:
+	}
+
+	select {
+	case <-c.readyCh:
+		return nil
+	case <-c.closedCh:
 		return ErrConnectorClosedBeforeReady
 	case <-ctx.Done():
 		return ctx.Err()
@@ -784,9 +799,7 @@ func (c *connector) Close() {
 		if !isClosed(c.cancelCh) {
 			close(c.cancelCh)
 		}
-		if !isClosed(c.readyCh) {
-			close(c.readyCh)
-		}
+		close(c.closedCh)
 
 		// Close snapshotter connections if still open (fallback for crash/error scenarios)
 		// Normal flow: connections are already closed in finalizeSnapshot() when snapshot completes
