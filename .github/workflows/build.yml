@@ -42,10 +42,68 @@ jobs:
         run: go test -v ./...
 
   security-gates:
-    uses: Trendyol/security-actions/.github/workflows/security-gates.yml@master
     needs: build
+    runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
       security-events: write
-    secrets: inherit
+    env:
+      APPSEC_ELASTIC_URL: ${{ secrets.APPSEC_ELASTIC_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        run: |
+          mkdir -p sarif
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
+          tar -xzf gitleaks_8.28.0_linux_x64.tar.gz
+          ./gitleaks detect --source . --report-format sarif --report-path sarif/gitleaks.sarif --redact --exit-code=0
+
+      - name: Run Semgrep
+        run: |
+          pip install semgrep
+          semgrep scan --config="p/default" --sarif --output=sarif/semgrep.sarif || true
+
+      - name: Run Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          grype dir:. -o sarif > sarif/grype.sarif || true
+
+      - name: Upload results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && github.event.repository.private == false
+        with:
+          sarif_file: sarif
+          checkout_path: ${{ github.workspace }}
+
+      # The scanners always run. This post runs only when the repository has the
+      # endpoint secret. An empty URL makes curl fail the job.
+      - name: Send results to the endpoint
+        if: env.APPSEC_ELASTIC_URL
+        env:
+          APPSEC_ELASTIC_USER: ${{ secrets.APPSEC_ELASTIC_USER }}
+          APPSEC_ELASTIC_PASS: ${{ secrets.APPSEC_ELASTIC_PASS }}
+          CA_CERT: ${{ secrets.APPSEC_CA }}
+        run: |
+          echo "$CA_CERT" > trendyolrootca.crt
+          count() { jq '[.runs[].results[]?] | length' "$1" 2>/dev/null || echo 0; }
+          payload=$(jq -n \
+            --arg timestamp "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg repo "${{ github.repository }}" \
+            --argjson leaks "$(count sarif/gitleaks.sarif)" \
+            --argjson semgrep "$(count sarif/semgrep.sarif)" \
+            --argjson grype "$(jq '[.runs[].results[]? | select(.properties.severity == "Critical")] | length' sarif/grype.sarif 2>/dev/null || echo 0)" \
+            '{
+              "@timestamp": $timestamp,
+              repository: $repo,
+              vulnerability_summary: {gitleaks: $leaks, semgrep_total: $semgrep, grype_critical: $grype}
+            }')
+          curl -sS -X POST "$APPSEC_ELASTIC_URL" \
+            -u "$APPSEC_ELASTIC_USER:$APPSEC_ELASTIC_PASS" \
+            --cacert trendyolrootca.crt \
+            -H "Content-Type: application/json" \
+            -d "$payload"
