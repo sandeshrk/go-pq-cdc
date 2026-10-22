@@ -287,6 +287,22 @@ func TestBuildChunkQueryUsesPhysicalPartition(t *testing.T) {
 	}
 }
 
+func TestBuildChunkQueryQuotesMixedCaseLeafOnce(t *testing.T) {
+	s := &Snapshotter{}
+	chunk := &Chunk{
+		TableSchema:         "public",
+		TableName:           "events",
+		PhysicalTableSchema: "public",
+		PhysicalTableName:   "events_EU",
+		PartitionStrategy:   PartitionStrategyOffset,
+		ChunkSize:           10,
+	}
+
+	query := s.buildChunkQuery(chunk, "id", nil, "")
+	assert.Contains(t, query, `FROM "public"."events_EU" AS "events"`)
+	assert.NotContains(t, query, `""events_EU""`)
+}
+
 func TestBuildChunkValueStringIncludesPhysicalPartition(t *testing.T) {
 	s := &Snapshotter{}
 	chunk := &Chunk{

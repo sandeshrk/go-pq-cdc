@@ -206,7 +206,7 @@ func (s *Snapshotter) executeChunkProcessing(ctx context.Context, slotName, inst
 // and skipping those chunks would silently lose rows.
 func (s *Snapshotter) relationDropped(ctx context.Context, chunk *Chunk) bool {
 	results, err := s.execQuery(ctx, s.metadataConn, fmt.Sprintf(
-		"SELECT to_regclass('%s.%s') IS NULL", chunk.PhysicalTableSchema, chunk.PhysicalTableName))
+		"SELECT to_regclass('%s') IS NULL", quoteQualifiedTable(chunk.PhysicalTableSchema, chunk.PhysicalTableName)))
 	if err != nil || len(results) == 0 || len(results[0].Rows) == 0 {
 		return false
 	}

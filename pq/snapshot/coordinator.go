@@ -752,7 +752,7 @@ func (s *Snapshotter) sizingFrom(schema, name string) string {
 }
 
 func (s *Snapshotter) getLeafPartitions(ctx context.Context, conn pq.Connection, table publication.Table) ([]physicalTable, bool, error) {
-	relationQuery := fmt.Sprintf("SELECT relkind FROM pg_class WHERE oid = to_regclass('%s.%s')", table.Schema, table.Name)
+	relationQuery := fmt.Sprintf("SELECT relkind FROM pg_class WHERE oid = to_regclass('%s')", quoteQualifiedTable(table.Schema, table.Name))
 	results, err := s.execQuery(ctx, conn, relationQuery)
 	if err != nil {
 		return nil, false, errors.Wrap(err, "inspect table relation kind")
@@ -765,20 +765,21 @@ func (s *Snapshotter) getLeafPartitions(ctx context.Context, conn pq.Connection,
 	}
 
 	// pg_inherits instead of pg_partition_tree: the latter needs PostgreSQL 12+.
-	// quote_ident: leaf names come from the catalog and are spliced into SQL as-is.
+	// Store the raw catalog names. Callers quote them once when they build SQL.
+	// quote_ident here would make a later QuoteIdentifier wrap the name a second time.
 	partitionQuery := fmt.Sprintf(`
 		WITH RECURSIVE tree AS (
-			SELECT to_regclass('%s.%s')::oid AS relid
+			SELECT to_regclass('%s')::oid AS relid
 			UNION ALL
 			SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON i.inhparent = t.relid
 		)
-		SELECT quote_ident(n.nspname), quote_ident(c.relname)
+		SELECT n.nspname, c.relname
 		FROM tree
 		JOIN pg_class c ON c.oid = tree.relid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relkind <> 'p'
 		ORDER BY 1, 2
-	`, table.Schema, table.Name)
+	`, quoteQualifiedTable(table.Schema, table.Name))
 	results, err = s.execQuery(ctx, conn, partitionQuery)
 	if err != nil {
 		return nil, true, errors.Wrap(err, "discover leaf partitions")
