@@ -287,6 +287,11 @@ func TestBuildChunkQueryUsesPhysicalPartition(t *testing.T) {
 	}
 }
 
+func TestQuoteQualifiedTableQuotesANameOnce(t *testing.T) {
+	assert.Equal(t, `"public"."events_EU"`, quoteQualifiedTable("public", "events_EU"))
+	assert.Equal(t, `"public"."events_EU"`, quoteQualifiedTable(`"public"`, `"events_EU"`))
+}
+
 func TestBuildChunkQueryQuotesMixedCaseLeafOnce(t *testing.T) {
 	s := &Snapshotter{}
 	chunk := &Chunk{
@@ -299,6 +304,12 @@ func TestBuildChunkQueryQuotesMixedCaseLeafOnce(t *testing.T) {
 	}
 
 	query := s.buildChunkQuery(chunk, "id", nil, "")
+	assert.Contains(t, query, `FROM "public"."events_EU" AS "events"`)
+	assert.NotContains(t, query, `""events_EU""`)
+
+	chunk.PhysicalTableSchema = `"public"`
+	chunk.PhysicalTableName = `"events_EU"`
+	query = s.buildChunkQuery(chunk, "id", nil, "")
 	assert.Contains(t, query, `FROM "public"."events_EU" AS "events"`)
 	assert.NotContains(t, query, `""events_EU""`)
 }

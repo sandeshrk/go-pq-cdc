@@ -765,15 +765,15 @@ func (s *Snapshotter) getLeafPartitions(ctx context.Context, conn pq.Connection,
 	}
 
 	// pg_inherits instead of pg_partition_tree: the latter needs PostgreSQL 12+.
-	// Store the raw catalog names. Callers quote them once when they build SQL.
-	// quote_ident here would make a later QuoteIdentifier wrap the name a second time.
+	// quote_ident stores a mixed-case leaf already quoted. SQL builders quote a name
+	// only when it is not already quoted.
 	partitionQuery := fmt.Sprintf(`
 		WITH RECURSIVE tree AS (
 			SELECT to_regclass('%s')::oid AS relid
 			UNION ALL
 			SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON i.inhparent = t.relid
 		)
-		SELECT n.nspname, c.relname
+		SELECT quote_ident(n.nspname), quote_ident(c.relname)
 		FROM tree
 		JOIN pg_class c ON c.oid = tree.relid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
