@@ -39,11 +39,11 @@ var errDialRefused = fakeDialError{msg: "dial refused"}
 // replication.Test() (called from setup()) needs, since Connect succeeding
 // is the only thing under test here.
 type reconnectFakeConn struct {
-	mu               sync.Mutex
+	fe               *pgproto3.Frontend
 	connectCalls     int
 	failConnectUntil int
+	mu               sync.Mutex
 	closed           bool
-	fe               *pgproto3.Frontend
 }
 
 func newReconnectFakeConn(failConnectUntil int) *reconnectFakeConn {
@@ -309,10 +309,10 @@ func TestSinkReportsFatalErrorAfterReconnectBudgetExhausted(t *testing.T) {
 // (as Close() would cause) rather than another failure - proving sink()
 // itself, not just reconnect() in isolation, resumes normally with no panic.
 type recoversOnSecondConnectConn struct {
-	mu           sync.Mutex
+	closedFlag   *atomic.Bool
 	connectCalls int
 	recvCalls    int
-	closedFlag   *atomic.Bool
+	mu           sync.Mutex
 }
 
 func (c *recoversOnSecondConnectConn) Connect(context.Context) error {

@@ -17,6 +17,8 @@ import (
 	libpq "github.com/lib/pq"
 )
 
+const columnTypeBigint = "BIGINT"
+
 type primaryKeyColumn struct {
 	Name     string
 	DataType string
@@ -363,13 +365,13 @@ func (s *Snapshotter) migrateSchema(ctx context.Context) error {
 	// These ALTER statements are idempotent (IF NOT EXISTS) and safe to run on every startup
 	migrations := []struct{ column, definition string }{
 		// CTID block partitioning fields
-		{"block_start", "BIGINT"},
-		{"block_end", "BIGINT"},
+		{"block_start", columnTypeBigint},
+		{"block_end", columnTypeBigint},
 		{"is_last_chunk", "BOOLEAN DEFAULT FALSE"},
 		{"partition_strategy", "TEXT DEFAULT 'offset'"},
 		// Integer range partitioning fields
-		{"range_start", "BIGINT"},
-		{"range_end", "BIGINT"},
+		{"range_start", columnTypeBigint},
+		{"range_end", columnTypeBigint},
 		// Physical relation used when the configured table is a partitioned root
 		{"physical_table_schema", "TEXT"},
 		{"physical_table_name", "TEXT"},

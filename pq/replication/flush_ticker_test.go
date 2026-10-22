@@ -65,8 +65,8 @@ func (m *warningCapturingMetric) Count() int {
 // goroutine, which is all these tests need (pgproto3.Frontend writes to it
 // off the test goroutine that polls its contents).
 type syncBuffer struct {
-	mu  sync.Mutex
 	buf bytes.Buffer
+	mu  sync.Mutex
 }
 
 func (b *syncBuffer) Write(p []byte) (int, error) {

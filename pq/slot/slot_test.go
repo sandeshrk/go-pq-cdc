@@ -30,11 +30,11 @@ func TestReplicationSlotCommandsQuoteTheName(t *testing.T) {
 // error-carrying MultiResultReader without panicking. The tests assert on the
 // reconnect/retry decisions via the call counters, not on query results.
 type fakeSlotConn struct {
-	closed       bool
 	connectErr   error
+	execHook     func(call int)
 	connectCalls int
 	execCalls    int
-	execHook     func(call int)
+	closed       bool
 }
 
 func (c *fakeSlotConn) Connect(context.Context) error {

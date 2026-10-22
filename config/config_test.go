@@ -628,13 +628,13 @@ func TestReconnectConfigValidate(t *testing.T) {
 	t.Run("rejects negative durations", func(t *testing.T) {
 		tests := []struct {
 			name string
-			cfg  ReconnectConfig
 			want string
+			cfg  ReconnectConfig
 		}{
-			{"initialDelay", ReconnectConfig{InitialDelay: -1}, "reconnect.initialDelay cannot be negative"},
-			{"maxDelay", ReconnectConfig{MaxDelay: -1}, "reconnect.maxDelay cannot be negative"},
-			{"maxJitter", ReconnectConfig{MaxJitter: -1}, "reconnect.maxJitter cannot be negative"},
-			{"maxElapsed", ReconnectConfig{MaxElapsed: -1}, "reconnect.maxElapsed cannot be negative"},
+			{name: "initialDelay", cfg: ReconnectConfig{InitialDelay: -1}, want: "reconnect.initialDelay cannot be negative"},
+			{name: "maxDelay", cfg: ReconnectConfig{MaxDelay: -1}, want: "reconnect.maxDelay cannot be negative"},
+			{name: "maxJitter", cfg: ReconnectConfig{MaxJitter: -1}, want: "reconnect.maxJitter cannot be negative"},
+			{name: "maxElapsed", cfg: ReconnectConfig{MaxElapsed: -1}, want: "reconnect.maxElapsed cannot be negative"},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {

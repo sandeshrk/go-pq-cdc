@@ -30,6 +30,10 @@ const (
 	regularExpectedRows             = int64(75)
 	chunkSize                       = int64(10)
 	publicationName                 = "partitioned_snapshot_publication"
+	publicSchema                    = "public"
+	operationInsert                 = "insert"
+	operationUpdate                 = "update"
+	operationDelete                 = "delete"
 )
 
 var (
@@ -84,18 +88,18 @@ func main() {
 
 	tables := publication.Tables{
 		{
-			Schema:          "public",
+			Schema:          publicSchema,
 			Name:            partitionedTableName,
 			ReplicaIdentity: publication.ReplicaIdentityDefault,
 			Partitioned:     true,
 		},
 		{
-			Schema:          "public",
+			Schema:          publicSchema,
 			Name:            regularTableName,
 			ReplicaIdentity: publication.ReplicaIdentityDefault,
 		},
 		{
-			Schema:          "public",
+			Schema:          publicSchema,
 			Name:            filteredPartitionedTableName,
 			ReplicaIdentity: publication.ReplicaIdentityDefault,
 			Partitioned:     true,
@@ -164,11 +168,11 @@ func handleMessage(ctx *replication.ListenerContext) {
 	case *format.Snapshot:
 		handleSnapshot(message)
 	case *format.Insert:
-		cdcEvents <- liveEvent{operation: "insert", table: message.TableName, id: fmt.Sprint(message.Decoded["event_id"])}
+		cdcEvents <- liveEvent{operation: operationInsert, table: message.TableName, id: fmt.Sprint(message.Decoded["event_id"])}
 	case *format.Update:
-		cdcEvents <- liveEvent{operation: "update", table: message.TableName, id: fmt.Sprint(message.NewDecoded["event_id"])}
+		cdcEvents <- liveEvent{operation: operationUpdate, table: message.TableName, id: fmt.Sprint(message.NewDecoded["event_id"])}
 	case *format.Delete:
-		cdcEvents <- liveEvent{operation: "delete", table: message.TableName, id: fmt.Sprint(message.OldDecoded["event_id"])}
+		cdcEvents <- liveEvent{operation: operationDelete, table: message.TableName, id: fmt.Sprint(message.OldDecoded["event_id"])}
 	}
 	if err := ctx.Ack(); err != nil {
 		select {
@@ -218,16 +222,16 @@ func simulateCDC(ctx context.Context, host string, port int) error {
 		want  liveEvent
 		query string
 	}{
-		{liveEvent{"insert", partitionedTableName, "2001"}, `INSERT INTO public.partitioned_events VALUES (2001, DATE '2026-03-15', '{"state":"inserted"}')`},
-		{liveEvent{"update", partitionedTableName, "2001"}, `UPDATE public.partitioned_events SET payload = '{"state":"updated"}' WHERE event_id = 2001 AND created_date = DATE '2026-03-15'`},
-		{liveEvent{"delete", partitionedTableName, "2001"}, `DELETE FROM public.partitioned_events WHERE event_id = 2001 AND created_date = DATE '2026-03-15'`},
-		{liveEvent{"insert", regularTableName, "1001"}, `INSERT INTO public.regular_events VALUES (1001, '{"state":"inserted"}')`},
-		{liveEvent{"update", regularTableName, "1001"}, `UPDATE public.regular_events SET payload = '{"state":"updated"}' WHERE event_id = 1001`},
-		{liveEvent{"delete", regularTableName, "1001"}, `DELETE FROM public.regular_events WHERE event_id = 1001`},
+		{liveEvent{operationInsert, partitionedTableName, "2001"}, `INSERT INTO public.partitioned_events VALUES (2001, DATE '2026-03-15', '{"state":"inserted"}')`},
+		{liveEvent{operationUpdate, partitionedTableName, "2001"}, `UPDATE public.partitioned_events SET payload = '{"state":"updated"}' WHERE event_id = 2001 AND created_date = DATE '2026-03-15'`},
+		{liveEvent{operationDelete, partitionedTableName, "2001"}, `DELETE FROM public.partitioned_events WHERE event_id = 2001 AND created_date = DATE '2026-03-15'`},
+		{liveEvent{operationInsert, regularTableName, "1001"}, `INSERT INTO public.regular_events VALUES (1001, '{"state":"inserted"}')`},
+		{liveEvent{operationUpdate, regularTableName, "1001"}, `UPDATE public.regular_events SET payload = '{"state":"updated"}' WHERE event_id = 1001`},
+		{liveEvent{operationDelete, regularTableName, "1001"}, `DELETE FROM public.regular_events WHERE event_id = 1001`},
 		// QueryCondition applies to snapshot reads only; inactive live changes must still arrive.
-		{liveEvent{"insert", filteredPartitionedTableName, "1001"}, `INSERT INTO public.filtered_partitioned_events VALUES (1001, DATE '2026-03-15', 'inactive', '{"state":"inserted"}')`},
-		{liveEvent{"update", filteredPartitionedTableName, "1001"}, `UPDATE public.filtered_partitioned_events SET payload = '{"state":"updated"}' WHERE event_id = 1001 AND created_date = DATE '2026-03-15'`},
-		{liveEvent{"delete", filteredPartitionedTableName, "1001"}, `DELETE FROM public.filtered_partitioned_events WHERE event_id = 1001 AND created_date = DATE '2026-03-15'`},
+		{liveEvent{operationInsert, filteredPartitionedTableName, "1001"}, `INSERT INTO public.filtered_partitioned_events VALUES (1001, DATE '2026-03-15', 'inactive', '{"state":"inserted"}')`},
+		{liveEvent{operationUpdate, filteredPartitionedTableName, "1001"}, `UPDATE public.filtered_partitioned_events SET payload = '{"state":"updated"}' WHERE event_id = 1001 AND created_date = DATE '2026-03-15'`},
+		{liveEvent{operationDelete, filteredPartitionedTableName, "1001"}, `DELETE FROM public.filtered_partitioned_events WHERE event_id = 1001 AND created_date = DATE '2026-03-15'`},
 	}
 
 	for _, step := range steps {
