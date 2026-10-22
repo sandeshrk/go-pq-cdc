@@ -2,9 +2,10 @@ package replication
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	goerrors "errors"
 	"fmt"
-	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -193,11 +194,23 @@ func (g *visibilityGuard) wait(ctx context.Context, xid uint32) (err error) {
 // backoff returns this round's jittered sleep, capped at remaining, and the
 // next base delay (doubling up to maxPollInterval). Shared with the replica guard.
 func backoff(delay, remaining time.Duration) (sleep, next time.Duration) {
-	sleep = delay + rand.N(delay/2+1) //nolint:gosec // jitter only
+	sleep = delay + jitter(delay/2+1)
 	if sleep > remaining {
 		sleep = remaining
 	}
 	return sleep, min(delay*2, maxPollInterval)
+}
+
+// jitter returns a duration in [0, n). A read error returns no jitter.
+func jitter(n time.Duration) time.Duration {
+	if n <= 0 {
+		return 0
+	}
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return 0
+	}
+	return time.Duration(binary.BigEndian.Uint64(buf[:]) % uint64(n))
 }
 
 func (g *visibilityGuard) poll(ctx context.Context) (pgSnapshot, error) {
@@ -267,7 +280,15 @@ func parseSnapshot(s string) (pgSnapshot, error) {
 
 func parseXid(s string) (uint32, error) {
 	v, err := strconv.ParseUint(s, 10, 64)
-	return uint32(v), err
+	if err != nil {
+		return 0, err
+	}
+	return xidLowBits(v), nil
+}
+
+// xidLowBits keeps the low 32 bits. Snapshot values can include an epoch above those bits.
+func xidLowBits(v uint64) uint32 {
+	return uint32(v)
 }
 
 // visible applies PostgreSQL's own rule: everything at or past xmax is
