@@ -2,6 +2,7 @@ package metric
 
 import (
 	"os"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -53,6 +54,13 @@ type Metric interface {
 	// section of the README.
 	ReplayedMessageIncrement()
 
+	// Visibility guard metrics
+	ObserveVisibilityWait(d time.Duration)
+	VisibilityTimeoutIncrement()
+	VisibilityFailOpenIncrement()
+	SetVisibilityReplicaLag(replica string, lagBytes float64)
+	VisibilityReplicaCheck(replica string, cached bool)
+
 	PrometheusCollectors() []prometheus.Collector
 }
 
@@ -91,6 +99,13 @@ type metric struct {
 	reconnectFailures  prometheus.Counter
 	reconnecting       prometheus.Gauge
 	replayedMessages   prometheus.Counter
+
+	// Visibility guard metrics
+	visibilityWaitDuration    prometheus.Histogram
+	visibilityTimeoutTotal    prometheus.Counter
+	visibilityFailOpenTotal   prometheus.Counter
+	visibilityReplicaLagBytes *prometheus.GaugeVec
+	visibilityReplicaChecks   *prometheus.CounterVec
 }
 
 //nolint:funlen
@@ -367,6 +382,57 @@ func NewMetric(slotName string) Metric {
 				"host":      hostname,
 			},
 		}),
+		visibilityWaitDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "wait_duration_seconds",
+			Help:      "time the visibility guard held a transaction until it became visible on the primary",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 15),
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityTimeoutTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "timeout_total",
+			Help:      "number of visibility guard waits that reached visibilityGuard.timeout",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityFailOpenTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "fail_open_total",
+			Help:      "number of messages dispatched after a visibility guard timeout (failMode: open)",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityReplicaLagBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "replica_lag_bytes",
+			Help:      "WAL bytes a listed standby still has to replay before the transaction held by the visibility guard is applied (0 once applied)",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}, []string{"replica"}),
+		visibilityReplicaChecks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "replica_checks_total",
+			Help:      "transactions certified per listed standby, by source: cached (a recent poll already passed the commit) or polled",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}, []string{"replica", "result"}),
 	}
 }
 
@@ -399,6 +465,11 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.reconnectFailures,
 		m.reconnecting,
 		m.replayedMessages,
+		m.visibilityWaitDuration,
+		m.visibilityTimeoutTotal,
+		m.visibilityFailOpenTotal,
+		m.visibilityReplicaLagBytes,
+		m.visibilityReplicaChecks,
 	}
 }
 
@@ -515,4 +586,28 @@ func (m *metric) SetReconnecting(active bool) {
 
 func (m *metric) ReplayedMessageIncrement() {
 	m.replayedMessages.Inc()
+}
+
+func (m *metric) ObserveVisibilityWait(d time.Duration) {
+	m.visibilityWaitDuration.Observe(d.Seconds())
+}
+
+func (m *metric) VisibilityTimeoutIncrement() {
+	m.visibilityTimeoutTotal.Inc()
+}
+
+func (m *metric) VisibilityFailOpenIncrement() {
+	m.visibilityFailOpenTotal.Inc()
+}
+
+func (m *metric) SetVisibilityReplicaLag(replica string, lagBytes float64) {
+	m.visibilityReplicaLagBytes.WithLabelValues(replica).Set(lagBytes)
+}
+
+func (m *metric) VisibilityReplicaCheck(replica string, cached bool) {
+	result := "polled"
+	if cached {
+		result = "cached"
+	}
+	m.visibilityReplicaChecks.WithLabelValues(replica, result).Inc()
 }

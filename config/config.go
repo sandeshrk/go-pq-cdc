@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"slices"
 	"strconv"
@@ -19,17 +20,18 @@ import (
 const defaultSchema = "public"
 
 type Config struct {
-	Logger      LoggerConfig       `json:"logger" yaml:"logger"`
-	Host        string             `json:"host" yaml:"host"`
-	Username    string             `json:"username" yaml:"username"`
-	Password    string             `json:"password" yaml:"password"`
-	Database    string             `json:"database" yaml:"database"`
-	Publication publication.Config `json:"publication" yaml:"publication"`
-	Heartbeat   HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
-	Slot        slot.Config        `json:"slot" yaml:"slot"`
-	Snapshot    SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
-	Port        int                `json:"port" yaml:"port"`
-	Metric      MetricConfig       `json:"metric" yaml:"metric"`
+	Logger          LoggerConfig          `json:"logger" yaml:"logger"`
+	Host            string                `json:"host" yaml:"host"`
+	Username        string                `json:"username" yaml:"username"`
+	Password        string                `json:"password" yaml:"password"`
+	Database        string                `json:"database" yaml:"database"`
+	Publication     publication.Config    `json:"publication" yaml:"publication"`
+	Heartbeat       HeartbeatConfig       `json:"heartbeat" yaml:"heartbeat"`
+	Slot            slot.Config           `json:"slot" yaml:"slot"`
+	VisibilityGuard VisibilityGuardConfig `json:"visibilityGuard" yaml:"visibilityGuard"`
+	Snapshot        SnapshotConfig        `json:"snapshot" yaml:"snapshot"`
+	Port            int                   `json:"port" yaml:"port"`
+	Metric          MetricConfig          `json:"metric" yaml:"metric"`
 	// ConnectTimeout bounds establishing a connection. Without it a blackholed
 	// host is bounded only by the OS TCP timeout. Defaults to 10s.
 	ConnectTimeout time.Duration `json:"connectTimeout" yaml:"connectTimeout"`
@@ -58,6 +60,60 @@ type Config struct {
 	// Reconnect governs in-process reconnection of the replication stream
 	// after an unrecoverable connection loss. See ReconnectConfig.
 	Reconnect ReconnectConfig `json:"reconnect" yaml:"reconnect"`
+}
+
+// VisibilityGuardConfig holds the first message of every transaction until the
+// transaction is visible to new snapshots on the primary. See
+// docs/visibility-gate-design.md.
+type VisibilityGuardConfig struct {
+	// Replicas lists standbys (host:port) that must have replayed the
+	// transaction's commit record before its first message is dispatched.
+	// Credentials and database come from the main config. Direct hosts only,
+	// never a pooled endpoint. See docs/replica-guard-design.md.
+	FailMode     VisibilityFailMode `json:"failMode" yaml:"failMode"`
+	Replicas     []string           `json:"replicas" yaml:"replicas"`
+	Timeout      time.Duration      `json:"timeout" yaml:"timeout"`
+	PollInterval time.Duration      `json:"pollInterval" yaml:"pollInterval"`
+	Enabled      bool               `json:"enabled" yaml:"enabled"`
+}
+
+type VisibilityFailMode string
+
+const (
+	// VisibilityFailClosed restarts the stream on a timeout or guard error; the message is redelivered.
+	VisibilityFailClosed VisibilityFailMode = "closed"
+	// VisibilityFailOpen logs a warning and dispatches anyway on a timeout; guard errors still restart the stream.
+	VisibilityFailOpen VisibilityFailMode = "open"
+)
+
+func (v *VisibilityGuardConfig) Validate() error {
+	if !v.Enabled {
+		if len(v.Replicas) > 0 {
+			return errors.New("visibilityGuard.replicas requires visibilityGuard.enabled: true")
+		}
+		return nil
+	}
+	var err error
+	seen := make(map[string]bool, len(v.Replicas))
+	for _, r := range v.Replicas {
+		if _, _, e := net.SplitHostPort(r); e != nil {
+			err = errors.Join(err, fmt.Errorf("visibilityGuard.replicas: %q must be host:port", r))
+		}
+		if seen[r] {
+			err = errors.Join(err, fmt.Errorf("visibilityGuard.replicas: %q listed twice", r))
+		}
+		seen[r] = true
+	}
+	if v.FailMode != VisibilityFailClosed && v.FailMode != VisibilityFailOpen {
+		err = errors.Join(err, errors.New("visibilityGuard.failMode must be 'closed' or 'open'"))
+	}
+	if v.Timeout <= 0 {
+		err = errors.Join(err, errors.New("visibilityGuard.timeout must be greater than 0"))
+	}
+	if v.PollInterval <= 0 {
+		err = errors.Join(err, errors.New("visibilityGuard.pollInterval must be greater than 0"))
+	}
+	return err
 }
 
 type MetricConfig struct {
@@ -144,6 +200,11 @@ func (c *Config) ReplicationDSN() string {
 	return c.dsn(params)
 }
 
+// ReplicaDSN is DSN() pointed at one visibilityGuard.replicas entry (host:port).
+func (c *Config) ReplicaDSN(hostPort string) string {
+	return fmt.Sprintf("postgres://%s:%s@%s/%s", url.QueryEscape(c.Username), url.QueryEscape(c.Password), hostPort, c.Database)
+}
+
 func (c *Config) DSNWithoutSSL() string {
 	params := url.Values{"sslmode": []string{"disable"}}
 	return c.dsn(params)
@@ -215,6 +276,18 @@ func (c *Config) SetDefault() {
 
 	if c.Logger.Logger == nil {
 		c.Logger.Logger = logger.NewSlog(c.Logger.LogLevel)
+	}
+
+	if c.VisibilityGuard.Enabled {
+		if c.VisibilityGuard.FailMode == "" {
+			c.VisibilityGuard.FailMode = VisibilityFailClosed
+		}
+		if c.VisibilityGuard.Timeout == 0 {
+			c.VisibilityGuard.Timeout = 10 * time.Second
+		}
+		if c.VisibilityGuard.PollInterval == 0 {
+			c.VisibilityGuard.PollInterval = 5 * time.Millisecond
+		}
 	}
 
 	// Set default schema names for tables
@@ -372,6 +445,10 @@ func (c *Config) Validate() error {
 		}
 
 		if cErr := c.Slot.Validate(); cErr != nil {
+			err = errors.Join(err, cErr)
+		}
+
+		if cErr := c.VisibilityGuard.Validate(); cErr != nil {
 			err = errors.Join(err, cErr)
 		}
 	}

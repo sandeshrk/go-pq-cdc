@@ -41,6 +41,9 @@ ensuring low resource consumption and high performance.
 		- [Configuration](#configuration)
 		- [Protocol Version \& Streaming Transactions](#protocol-version--streaming-transactions)
 		- [API](#api)
+		- [Visibility Guard](#visibility-guard)
+		- [Commit LSN and reading from a standby](#commit-lsn-and-reading-from-a-standby)
+		- [Failover slots (PostgreSQL 17+)](#failover-slots-postgresql-17)
 		- [Exposed Metrics](#exposed-metrics)
 		- [Grafana Dashboard](#grafana-dashboard)
 		- [Compatibility](#compatibility)
@@ -159,6 +162,8 @@ func Handler(ctx *replication.ListenerContext) {
 * [PostgreSQL to Kafka](https://github.com/Trendyol/go-pq-cdc-kafka/tree/main/example/simple)
 * [PostgreSQL to PostgreSQL](./example/postgresql)
 * [Partitioned Tables](./example/partitioned-table-mapping)
+* [Visibility Guard Lab](./example/visibility-guard)
+* [Reading a Standby After an Event (CommitLSN)](./example/replica-read)
 
 ### PostgreSQL User Permissions
 
@@ -184,6 +189,7 @@ Add these grants when the corresponding feature is enabled:
 | Heartbeat with auto-created table             | `GRANT CREATE ON SCHEMA <schema> TO cdc_user;` for the initial `CREATE TABLE`, plus `GRANT INSERT, UPDATE ON <heartbeat_table>` for the auto-managed singleton row. |
 | Snapshot mode (initial / only)                | `SELECT` on the source tables (already covered above).                                                                                    |
 | Adding tables to an existing publication      | The role must own the publication, e.g. `ALTER PUBLICATION cdc_publication OWNER TO cdc_user;`.                                           |
+| `visibilityGuard` (with or without `replicas`) | No extra grant: `pg_current_snapshot()`, `pg_last_wal_replay_lsn()`, `pg_control_recovery()` and `pg_control_system()` are callable by every role. `pg_hba.conf` on each listed standby must accept a normal connection from the CDC host. |
 
 Common failure modes when grants are missing:
 
@@ -435,9 +441,10 @@ A few sentinels are plain stdlib errors specifically so `errors.Is` works on the
 | `publication.tables[i].publicationFilter` |  string  |    no    |    -    | Native Postgres publication row filter (`CREATE`/`ALTER PUBLICATION ... WHERE (...)`). Unlike `queryCondition`, this DOES filter the live CDC/replication stream, not just the initial snapshot. Requires PostgreSQL 15+. | Example: `"status = 'active'"`. Cannot be combined with `replicaIdentity: NOTHING` (Postgres needs the old row to evaluate the filter on UPDATE/DELETE). When `createIfNotExists` is `false` and the publication already exists with a different filter, the connector reconciles it via `ALTER PUBLICATION ... SET TABLE`. Set to `"-"` (`publication.ClearPublicationFilter`) to remove an existing live filter -- an empty/omitted value means "not configured, leave the live filter alone", not "clear it". |
 | `publication.pruneTables`               |   bool   |    no    | false | When true, treats `publication.tables` as the full authoritative table membership: any live publication member missing from it is dropped via `ALTER PUBLICATION ... SET TABLE`. | Destructive if `publication.tables` is a deliberate subset -- only enable if config always lists every table that should remain published. Tables present in config but not yet live are always added regardless of this flag (see below). |
 | `slot.createIfNotExists`                |   bool   |    no    |    -    | Create replication slot if not exists. Otherwise, return `replication slot is not exists` error.      |                                                                                                                                                    |
-| `slot.name`                             |  string  |   yes    |    -    | Set the logical replication slot name                                                                 | Should be unique and descriptive.                                                                                                                  |
+| `slot.name`                             |  string  |   yes    |    -    | Set the logical replication slot name                                                                 | Should be unique and descriptive. Quoted when sent to PostgreSQL.                                                            |
 | `slot.slotActivityCheckerInterval`      |   int    |    no    |  1000   | Set the slot activity check interval time in milliseconds                                             | Specify as an integer value in milliseconds (e.g., `1000` for 1 second).                                                                           |
 | `slot.protoVersion`                     |   int    |    no    |    2    | `pgoutput` protocol version used in `START_REPLICATION`                                               | `1`: PostgreSQL 10+ compatibility, no streaming transaction protocol messages. `2`: PostgreSQL 14+, enables streaming/messages options.           |
+| `slot.failover`                         |   bool   |    no    |  false  | Create the slot with `FAILOVER true` (PostgreSQL 17+) so standbys running `sync_replication_slots` keep a synchronized copy; an existing slot is altered with `ALTER_REPLICATION_SLOT … (FAILOVER true)`. | Rejected with a clear error on older servers. Needs `synchronized_standby_slots` on the primary, see [Failover slots](#failover-slots-postgresql-17). |
 | `snapshot.enabled`                      |   bool   |    no    |  false  | Enable initial snapshot feature                                                                       | When enabled, captures existing data before starting CDC.                                                                                          |
 | `snapshot.mode`                         |  string  |    no    |  never  | Snapshot mode: `initial`, `never`, or `snapshot_only`                                                 | **initial:** Take snapshot only if no previous snapshot exists, then start CDC. <br> **never:** Skip snapshot, start CDC immediately. <br> **snapshot_only:** Take snapshot and exit (no CDC, no replication slot required). |
 | `snapshot.chunkSize`                    |  int64   |    no    |  8000   | Number of rows per chunk during snapshot                                                              | Adjust based on table size. Larger chunks = fewer chunks but more memory per chunk.                                                               |
@@ -450,6 +457,11 @@ A few sentinels are plain stdlib errors specifically so `errors.Is` works on the
 | `heartbeat.table.schema`                |  string  |    no    | public  | Schema of the heartbeat table.                                                                          | Defaults to `public` when omitted.                                                                            |
 | `heartbeat.interval`                    | duration |    no    | 100ms   | Interval between heartbeat updates when heartbeat is configured. Must be greater than 0.               | Any valid Go duration string (e.g. `100ms`, `1s`, `5s`, `1m`).                                                |
 | `extensionSupport.enableTimescaleDB`    |   bool   |    no    |  false  | Enable support for TimescaleDB hypertables. Ensures proper handling of compressed chunks during replication. |                                                                                                                                                    |
+| `visibilityGuard.enabled`               |   bool   |    no    |  false  | Hold the first event of every transaction until the transaction is visible to new snapshots on the primary (closes the logical-decoding read-after-write window; see [Visibility Guard](#visibility-guard)). | Opens one extra regular connection to the same host as the replication connection. Heartbeat events bypass the gate.                                |
+| `visibilityGuard.failMode`              |  string  |    no    | closed  | What to do when a transaction is not visible within `timeout`                                          | **closed:** restart the stream; the event is redelivered from the confirmed LSN. **open:** log a warning, count it, dispatch anyway. Guard errors (replica, failover, connection loss) restart the stream in both modes. |
+| `visibilityGuard.timeout`               | duration |    no    |  10s    | Maximum time to wait per transaction                                                                   | Must be less than half of the server's `wal_sender_timeout` (checked at startup, skipped when it is `0`): keepalive replies stop while the gate blocks. |
+| `visibilityGuard.pollInterval`          | duration |    no    |  5ms    | First poll interval; doubles up to 250ms with jitter                                                   |                                                                                                                                                    |
+| `visibilityGuard.replicas`              | []string |    no    |   []    | Standbys (`host:port`) that must have applied the transaction before its first event is dispatched (see [Visibility Guard](#visibility-guard)). | Requires `enabled: true`. Credentials and database come from the main config. Direct standby hosts only, never a pooled endpoint. Shares `timeout` and `failMode` with the primary check. |
 
 ### API
 
@@ -481,6 +493,170 @@ Streaming behavior for `proto_version: 2`:
 - `STREAM ABORT` discards all buffered events for that transaction.
 - This prevents rolled-back streamed transactions from leaking to consumers.
 
+### Visibility Guard
+
+**Mechanism.** The logical walsender streams a transaction as soon as its commit record is flushed to WAL. The rows
+become visible to new snapshots only later, when the committing backend finishes (`ProcArrayEndTransaction`), and with
+`synchronous_standby_names` set (Patroni `synchronous_mode`) that step first waits for the synchronous standby's
+acknowledgement. A consumer that receives the event and immediately reads the primary can therefore miss the row
+(read-after-write); the same ordering allows a "phantom" event if the primary dies before the standby received the
+commit. `visibilityGuard` closes this window: before dispatching the first event of every transaction it polls a
+regular connection on the same host until the transaction's xid is no longer in progress in `pg_current_snapshot()`
+(`txid_current_snapshot()` before PostgreSQL 13). Later events of the same transaction pass without a wait; heartbeat
+events bypass the gate.
+
+```yaml
+visibilityGuard:
+  enabled: true
+  failMode: closed   # closed | open
+  timeout: 10s       # must be < wal_sender_timeout / 2; covers the primary and every replica below
+  pollInterval: 5ms  # doubles up to 250ms, with jitter
+  replicas:          # optional: standbys that must have applied the transaction before dispatch
+    - standby1:5432
+    - standby2:5432
+```
+
+**Replicas.** `replicas` extends the gate to standbys. On every connection (at startup and after each reconnect) the
+listed host must belong to the replication session's cluster (`pg_control_system()`, compared with `IDENTIFY_SYSTEM`):
+a standby of another cluster is in recovery and answers with a replay position from a history `CommitLSN` is not part
+of, which would pass the check at once. After the primary check, the first event of every transaction is then held
+until each listed standby answers, on a connection of its own, `pg_is_in_recovery()` true,
+`pg_last_wal_replay_lsn() > CommitLSN` (strict, see [below](#commit-lsn-and-reading-from-a-standby)) and a timeline no
+newer than the replication session's. An event whose transaction has no decoded `BEGIN` (no xid, no `CommitLSN`) is
+never dispatched: the guard fails closed on it. Credentials and database come from the main config. List direct
+standby hosts, never a pooled or load-balanced endpoint: the check is only meaningful for the server that answered it.
+Both waits share `timeout`, standbys are polled concurrently, and the replica connections reconnect on their own
+(a standby shutting down answers `57P01` before closing; that is redialed like a reset), so a standby restart does not
+restart the stream. Every pass is logged (`replica guard wait completed`, Debug; `replica guard slow wait completed`,
+Info from 100 ms) with the xid, `CommitLSN`, and per replica the backend address and the replay position it
+certified. A poll that passed on a replica certifies every lower `CommitLSN` for the next second without another
+query (logged as `cached_age_ms`), so a busy stream costs about one poll per replica per second instead of one per
+transaction; a replica that is behind is still polled on every transaction until it passes. Design record:
+[docs/replica-guard-design.md](./docs/replica-guard-design.md).
+
+**Guarantee.** Everything delivered to the handler is committed on the server (with or without the guard). With the
+guard on, a fresh snapshot taken on the same primary after the handler was called also sees the row. With `replicas`
+set, every listed standby has applied the transaction when the handler is called, so a read on any of them under
+`READ COMMITTED` sees the row. One exception is built into hot standby: a standby that restarts replays again from its
+last restartpoint and accepts connections as soon as it is consistent, so for a moment its replay position can sit
+below a `CommitLSN` it had already applied. Because a passing poll is reused for up to one second, a transaction
+dispatched in that second can be certified by an observation made just before such a restart; the same consumer-side
+retry covers both.
+
+**Limits.** The guarantee does not cover:
+
+- Reads from a standby that is not listed in `replicas`, or through a pooler that may route to one. Use the strict
+  `CommitLSN` rule or `WaitReplayed` in [Commit LSN and reading from a standby](#commit-lsn-and-reading-from-a-standby).
+  In Patroni deployments this is the more likely cause of "the row is not there yet" than the primary-side window. A
+  standby added to the cluster later is not covered until it is added to `replicas`. A listed standby that is promoted
+  keeps the connector from starting (it is no longer in recovery) until `replicas` is updated or the node is rebuilt as
+  a standby, so list standbys only where their addresses are stable.
+- The consumer's own open `REPEATABLE READ` or `SERIALIZABLE` transaction: its snapshot predates the commit.
+- Later changes: the row may already be updated or deleted when the consumer reads it.
+- Row-level security and the privileges of the reading role.
+
+Consumer-side retry and self-contained outbox payloads remain the recommended pattern; the guard removes the common
+case, not the need for them.
+
+**Failure handling.** `failMode: closed` (default): a timeout or any guard error (server in recovery, timeline changed,
+connection lost) restarts the stream with the error class `visibility guard unreachable`; the held event is not acked
+and is redelivered from the confirmed LSN. `failMode: open`: after `timeout` the event is dispatched with a warning and
+`go_pq_cdc_visibility_fail_open_total` is incremented; guard errors still restart the stream. `timeout` must stay below
+half of the server's `wal_sender_timeout` (checked at startup, skipped when it is `0`) because keepalive replies stop
+while the gate blocks. Waits are recorded in `go_pq_cdc_visibility_wait_duration_seconds`, timeouts in
+`go_pq_cdc_visibility_timeout_total`.
+
+With `replicas`, a standby that is unreachable or still behind when `timeout` expires counts as a timeout and follows
+the same `failMode` rules. A chronically lagging standby therefore keeps the stream in a restart loop under `closed`,
+by design: raise `timeout` together with `wal_sender_timeout`, or use `open` with an alert on the timeout counter. A
+listed server that is not in recovery (a primary, a promoted standby, a pooler that routed elsewhere), one whose
+timeline is ahead of the replication session, or a server error on the poll is a guard error in both modes. Each
+standby's distance to the held transaction is exported as `go_pq_cdc_visibility_replica_lag_bytes{replica}`;
+`go_pq_cdc_visibility_replica_checks_total{replica,result}` counts certified transactions by `result="cached"` or
+`"polled"`, so the cache hit ratio shows whether a busy stream is still paying one round trip per transaction.
+
+**Synchronous replication corollary.** With `synchronous_standby_names` set, a transaction becomes visible on the
+primary only after the synchronous standby acknowledged it at the configured `synchronous_commit` level. A fail-closed
+guard therefore also prevents phantom events on a Patroni failover, without PostgreSQL 17 failover slots: an event is
+dispatched only once the standby that may be promoted has the commit. The same corollary is what closes the one race
+the replica check cannot see, a standby that is still receiving a new timeline and reports the old one; this is why
+`replicas` requires the primary guard. This holds unless:
+
+- Patroni runs `synchronous_mode` without `synchronous_mode_strict` and no standby is available: synchronous
+  replication is switched off and commits stop waiting.
+- The committing backend is cancelled or terminated while waiting for the standby: it commits locally and becomes
+  visible without the acknowledgement (the server logs a WARNING).
+- The session used `synchronous_commit = local` or `off`.
+- `synchronous_commit = remote_write`: the standby received the WAL but has not flushed it.
+
+### Commit LSN and reading from a standby
+
+Every CDC event exposes `ctx.Xid`, the top-level transaction that produced it, and `ctx.CommitLSN`, the WAL position of the commit record of that transaction
+(pgoutput `Begin.FinalLSN`, or `StreamCommit.CommitLSN` for streamed transactions). Snapshot events carry `0`.
+
+`visibilityGuard` only describes the primary. A consumer that reads from a standby, or through a pooler that may route
+to one, has to wait until the standby has replayed that commit record. The rule is **strict**:
+
+```sql
+SELECT pg_last_wal_replay_lsn() > '<ctx.CommitLSN>'::pg_lsn;
+```
+
+`pg_last_wal_replay_lsn()` reports the end of the last replayed record, so it equals `CommitLSN` right before the commit
+record itself is applied; `>=` is not enough. `ctx.CommitLSN.String()` prints the `pg_lsn` text form (`X/X`). The check
+is only as good as the way it is run:
+
+- Run the check and the read on the **same server**: the same connection, one transaction, or a pool pinned to one
+  standby. A replica endpoint that spreads connections over several standbys (HAProxy, pgbouncer with several hosts, a
+  DNS name with several addresses, a pool in the application) can pass the check on one standby and read from another.
+- Check first, then read, as separate statements under `READ COMMITTED`. `REPEATABLE READ` keeps the snapshot of the
+  first statement, and a single combined statement (`… WHERE id = $1 AND pg_last_wal_replay_lsn() > $2`) takes its
+  snapshot before the function is evaluated.
+- `NULL` from `pg_last_wal_replay_lsn()` means the connection reached a primary (or a promoted standby), not "already
+  applied". After a failover the new timeline can pass the old `CommitLSN` without containing that transaction.
+- `synchronous_commit = on` means flushed, not applied: a synchronous standby can still be behind on apply. Only
+  `remote_apply` on the producer, with the standby you read from listed in `synchronous_standby_names`, removes the
+  need for the check.
+
+PostgreSQL 17 and 18 have no server-side wait for a replay position (`pg_wal_replay_wait` is not in either release), so
+poll. `replication.WaitReplayed` runs that poll for you, with the guard's defaults (10s timeout, 5ms interval doubling
+to 250ms), on any `*pgx.Conn`, `*pgxpool.Conn` or `pgx.Tx`; pass the connection you will read from:
+
+```go
+conn, err := standbyPool.Acquire(ctx) // the connection the read will use
+defer conn.Release()
+if err = replication.WaitReplayed(ctx, conn, lCtx.CommitLSN, replication.WaitOptions{}); err != nil {
+    return err // replication.ErrNotStandby, replication.ErrVisibilityTimeout, or a connection error
+}
+err = conn.QueryRow(ctx, "SELECT ... FROM orders WHERE id = $1", id).Scan(...) // separate statement
+```
+
+To have the library wait instead, list the standby in `visibilityGuard.replicas`.
+[example/replica-read](./example/replica-read) demonstrates each point against a primary with two synchronous
+standbys.
+
+### Failover slots (PostgreSQL 17+)
+
+`slot.failover: true` creates the replication slot with `FAILOVER true`, or issues
+`ALTER_REPLICATION_SLOT … (FAILOVER true)` for an existing slot, so a standby running `sync_replication_slots` keeps a
+synchronized copy and the slot survives a failover without WAL loss. Servers older than 17 reject the option with a clear
+error. Required setup:
+
+- **Primary:** `synchronized_standby_slots = 'standby_physical_slot'`. The logical walsender then waits for the listed
+  physical slots before sending a change, so no event is delivered ahead of the standby that may become the next
+  primary. With the parameter empty there is no waiting: the synchronized slot can lag behind what consumers have already
+  seen, and those events are redelivered after failover.
+- **Standby:** `sync_replication_slots = on`, `hot_standby_feedback = on`, `primary_slot_name` set, and `dbname` in
+  `primary_conninfo`.
+- An inactive slot listed in `synchronized_standby_slots` stalls the logical walsender; remove it from the list before
+  taking that standby down for good.
+- Patroni 4.1.0+ leaves `failover = true` slots alone (no copy, no `pg_replication_slot_advance`) but does not set
+  `synchronized_standby_slots`; set it through `postgresql.parameters`.
+- If the slot is active for another process when go-pq-cdc starts (rolling deployment), the `ALTER` is skipped with a
+  warning and retried on the next start.
+
+Complementary to `visibilityGuard`: the guard closes the read-after-write window on the primary, the failover slot keeps
+the consumer position across a promotion.
+
 ### Exposed Metrics
 
 The client collects relevant metrics related to PostgreSQL change data capture (CDC) and makes them available at
@@ -509,6 +685,11 @@ the `/metrics` endpoint.
 | go_pq_cdc_snapshot_completed_chunks                 | Number of chunks completed in snapshot.                                                                | slot_name, host| Gauge      |
 | go_pq_cdc_snapshot_total_rows                       | Total number of rows read during snapshot.                                                             | slot_name, host| Counter    |
 | go_pq_cdc_snapshot_duration_seconds                 | Duration of the last snapshot operation in seconds.                                                    | slot_name, host| Gauge      |
+| go_pq_cdc_visibility_wait_duration_seconds          | Time the visibility guard held a transaction until it became visible on the primary.                   | slot_name, host| Histogram  |
+| go_pq_cdc_visibility_timeout_total                  | Number of visibility guard waits that reached `visibilityGuard.timeout`.                               | slot_name, host| Counter    |
+| go_pq_cdc_visibility_fail_open_total                | Number of transactions dispatched after a visibility guard timeout (`failMode: open`).                 | slot_name, host| Counter    |
+| go_pq_cdc_visibility_replica_lag_bytes              | WAL bytes a listed standby still has to replay before the held transaction is applied (0 once applied). | slot_name, host, replica | Gauge |
+| go_pq_cdc_visibility_replica_checks_total           | Transactions certified per standby: `cached` (a poll under 1 s old already passed the commit) or `polled`. | slot_name, host, replica, result | Counter |
 | runtime metrics                                     | [Prometheus Collector](https://golang.bg/src/runtime/metrics/description.go)                          | N/A            | N/A        |
 
 ### Grafana Dashboard

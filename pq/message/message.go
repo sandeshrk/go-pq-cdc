@@ -42,6 +42,9 @@ type Type uint8
 // skipMapDecode forwards config.Config.SkipTupleMapDecode to Insert/Update/
 // Delete messages; other message types ignore it.
 func New(data []byte, streamedTransaction bool, serverTime time.Time, relation map[uint32]*format.Relation, skipMapDecode bool) (any, error) {
+	if len(data) == 0 {
+		return nil, errors.New("empty message data")
+	}
 	switch Type(data[0]) {
 	case BeginByte:
 		return format.NewBegin(data)

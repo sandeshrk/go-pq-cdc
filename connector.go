@@ -260,10 +260,10 @@ func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb
 // initializePublication sets up and creates the publication.
 //
 // Replica identity is applied or checked depending on CreateIfNotExists:
-// - When CreateIfNotExists is true: ApplyReplicaIdentities may ALTER TABLE.
-// - When CreateIfNotExists is false: CheckReplicaIdentities is read-only; any
-//   failure is logged as Error with a manual-action hint and does not stop startup.
-//   See #158 for rationale.
+//   - When CreateIfNotExists is true: ApplyReplicaIdentities may ALTER TABLE.
+//   - When CreateIfNotExists is false: CheckReplicaIdentities is read-only; any
+//     failure is logged as Error with a manual-action hint and does not stop startup.
+//     See #158 for rationale.
 //
 // A freshly created publication already has all of its tables and row
 // filters embedded directly in CREATE PUBLICATION, so ApplyPublicationFilters
