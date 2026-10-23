@@ -159,6 +159,13 @@ func isTransientError(err error) bool {
 	return false
 }
 
+// isUndefinedTableError reports SQLSTATE 42P01 (undefined_table), also through Wrap chains
+func isUndefinedTableError(err error) bool {
+	// errors.Cause: go-playground/errors chains do not implement Unwrap
+	var pgErr *pgconn.PgError
+	return goerrors.As(errors.Cause(err), &pgErr) && pgErr.Code == "42P01"
+}
+
 // isInvalidSnapshotError checks if an error is due to invalid snapshot identifier
 // This occurs when the coordinator's snapshot transaction is closed/expired
 // Common in multi-pod deployments when coordinator restarts
@@ -215,5 +222,14 @@ func selectSnapshotColumns(columns []string) string {
 // mistaken for a schema separator, and an embedded quote in either part is
 // escaped rather than breaking the generated SQL.
 func quoteQualifiedTable(schema, table string) string {
-	return libpq.QuoteIdentifier(schema) + "." + libpq.QuoteIdentifier(table)
+	return quoteIdentOnce(schema) + "." + quoteIdentOnce(table)
+}
+
+// quoteIdentOnce quotes a raw catalog or config name. A name that quote_ident
+// already wrapped is returned unchanged, so a mixed-case leaf is not quoted twice.
+func quoteIdentOnce(name string) string {
+	if len(name) >= 2 && name[0] == '"' && name[len(name)-1] == '"' {
+		return name
+	}
+	return libpq.QuoteIdentifier(name)
 }

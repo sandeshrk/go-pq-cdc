@@ -10,47 +10,47 @@ import (
 func TestReconnectMetrics(t *testing.T) {
 	m := NewMetric("test_slot").(*metric)
 
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.reconnectAttempts))
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.reconnectSuccesses))
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.reconnectFailures))
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.reconnecting))
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.reconnectAttempts), 0)
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.reconnectSuccesses), 0)
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.reconnectFailures), 0)
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.reconnecting), 0)
 
 	m.ReconnectAttemptIncrement()
 	m.ReconnectAttemptIncrement()
-	assert.Equal(t, float64(2), testutil.ToFloat64(m.reconnectAttempts))
+	assert.InDelta(t, float64(2), testutil.ToFloat64(m.reconnectAttempts), 0)
 
 	m.SetReconnecting(true)
-	assert.Equal(t, float64(1), testutil.ToFloat64(m.reconnecting))
+	assert.InDelta(t, float64(1), testutil.ToFloat64(m.reconnecting), 0)
 	m.SetReconnecting(false)
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.reconnecting))
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.reconnecting), 0)
 
 	m.ReconnectSuccessIncrement()
-	assert.Equal(t, float64(1), testutil.ToFloat64(m.reconnectSuccesses))
+	assert.InDelta(t, float64(1), testutil.ToFloat64(m.reconnectSuccesses), 0)
 
 	m.ReconnectFailureIncrement()
-	assert.Equal(t, float64(1), testutil.ToFloat64(m.reconnectFailures))
+	assert.InDelta(t, float64(1), testutil.ToFloat64(m.reconnectFailures), 0)
 }
 
 func TestUnackedLSNLagMetric(t *testing.T) {
 	m := NewMetric("test_slot").(*metric)
 
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.unackedLSNLag))
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.unackedLSNLag), 0)
 
 	m.SetUnackedLSNLag(42)
-	assert.Equal(t, float64(42), testutil.ToFloat64(m.unackedLSNLag))
+	assert.InDelta(t, float64(42), testutil.ToFloat64(m.unackedLSNLag), 0)
 
 	m.SetUnackedLSNLag(0)
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.unackedLSNLag))
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.unackedLSNLag), 0)
 }
 
 func TestWALBacklogWarningMetric(t *testing.T) {
 	m := NewMetric("test_slot").(*metric)
 
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.walBacklogWarnings))
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.walBacklogWarnings), 0)
 
 	m.WALBacklogWarningIncrement()
 	m.WALBacklogWarningIncrement()
-	assert.Equal(t, float64(2), testutil.ToFloat64(m.walBacklogWarnings))
+	assert.InDelta(t, float64(2), testutil.ToFloat64(m.walBacklogWarnings), 0)
 }
 
 func TestReconnectMetricsRegisteredAsCollectors(t *testing.T) {
@@ -83,9 +83,9 @@ func TestReconnectMetricsRegisteredAsCollectors(t *testing.T) {
 func TestReplayedMessageMetric(t *testing.T) {
 	m := NewMetric("test_slot").(*metric)
 
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.replayedMessages))
+	assert.InDelta(t, float64(0), testutil.ToFloat64(m.replayedMessages), 0)
 
 	m.ReplayedMessageIncrement()
 	m.ReplayedMessageIncrement()
-	assert.Equal(t, float64(2), testutil.ToFloat64(m.replayedMessages))
+	assert.InDelta(t, float64(2), testutil.ToFloat64(m.replayedMessages), 0)
 }

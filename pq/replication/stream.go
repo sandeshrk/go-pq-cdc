@@ -38,6 +38,11 @@ var (
 	// default), or its budget was exhausted. The replication stream is dead
 	// at that point; a caller must build a new connector/stream to recover.
 	ErrStreamCorrupted = goerrors.New("replication stream corrupted: connection lost and reconnect is disabled or exhausted")
+	// ErrUndecodableMessage is sent on Err() when a WAL record cannot be
+	// decoded. The confirmed position is left unchanged. A new stream reads
+	// the same record again. A new connection is not opened first: the bytes
+	// on the server are unchanged.
+	ErrUndecodableMessage = goerrors.New("replication message could not be decoded")
 )
 
 const (
@@ -50,20 +55,30 @@ const (
 type ListenerContext struct {
 	Context context.Context
 	Message any
-	// WALStart is this message's own WAL position: Ack confirms this value,
-	// rewritten to the transaction-end LSN for the last change in a
-	// transaction. See the Delivery Guarantees section of the README.
-	WALStart pq.LSN
-	// CommitLSN is the commit record's own LSN (BEGIN.FinalLSN / STREAM
-	// COMMIT.CommitLSN) for Insert/Update/Delete messages, 0 for message
-	// types that carry no commit context (e.g. Relation, Truncate).
-	CommitLSN pq.LSN
-	Ack       func() error
+	Ack     func() error
 	// AckLSN confirms an arbitrary LSN instead of only WALStart, letting a
 	// transactional sink confirm a position it computed itself (e.g. after
 	// writing a whole transaction to its own store). A non-monotonic value
 	// (<= the already-confirmed position) is a silent no-op.
 	AckLSN func(lsn pq.LSN) error
+	// WALStart is this message's own WAL position: Ack confirms this value,
+	// rewritten to the transaction-end LSN for the last change in a
+	// transaction. See the Delivery Guarantees section of the README.
+	WALStart pq.LSN
+	// CommitLSN is the start of the commit record of the transaction that
+	// produced Message (pgoutput Begin.FinalLSN, StreamCommit.CommitLSN for
+	// streamed transactions). Zero for snapshot events and for message types
+	// that carry no commit context.
+	//
+	// A standby has applied that transaction only once
+	// pg_last_wal_replay_lsn() > CommitLSN. The comparison is strict:
+	// pg_last_wal_replay_lsn() reports the end of the last replayed record, so
+	// it equals CommitLSN right before the commit record itself is applied.
+	CommitLSN pq.LSN
+	// Xid is the top-level transaction that produced Message (Begin.Xid, or
+	// StreamStart.Xid for a streamed transaction). Zero when the message is
+	// not part of a transaction, including snapshot events.
+	Xid uint32
 }
 
 type ListenerFunc func(ctx *ListenerContext)
@@ -71,6 +86,12 @@ type ListenerFunc func(ctx *ListenerContext)
 type Message struct {
 	message  any
 	walStart int64
+	// xid is the top-level transaction the message belongs to (Begin.Xid or
+	// StreamStart.Xid); the visibility guard gates on it.
+	xid uint32
+	// commitLSN is the start of the transaction's commit record, exposed as
+	// ListenerContext.CommitLSN.
+	commitLSN pq.LSN
 }
 
 type Streamer interface {
@@ -89,20 +110,29 @@ type Streamer interface {
 }
 
 type stream struct {
-	metric           metric.Metric
-	conn             pq.Connection
-	cancel           context.CancelFunc
-	system           *pq.IdentifySystemResult
-	relation         map[uint32]*format.Relation
-	messageCH        chan *Message
-	listenerFunc     ListenerFunc
-	sinkEnd          chan struct{}
-	processEnd       chan struct{}
-	flushTickerEnd   chan struct{}
-	fatalCh          chan error
-	mu               *sync.RWMutex
+	metric         metric.Metric
+	conn           pq.Connection
+	relation       map[uint32]*format.Relation
+	replicas       *replicaGuard
+	cancel         context.CancelFunc
+	system         *pq.IdentifySystemResult
+	messageCH      chan *Message
+	listenerFunc   ListenerFunc
+	sinkEnd        chan struct{}
+	processEnd     chan struct{}
+	flushTickerEnd chan struct{}
+	fatalCh        chan error
+	mu             *sync.RWMutex
+	guard          *visibilityGuard
+	// txCommit holds the commit context of the non-streamed transaction
+	// currently being decoded, so each of its change messages can be stamped
+	// with it. Written and read only on the sink (reader) goroutine.
+	txCommit struct {
+		time time.Time
+		lsn  pq.LSN
+		xid  uint32
+	}
 	config           config.Config
-	lastXLogPos      pq.LSN
 	snapshotLSN      pq.LSN
 	confirmedXLogPos pq.LSN
 	// deliveredHighWaterMark is the highest walStart ever handed to
@@ -113,6 +143,7 @@ type stream struct {
 	// Every delivered message with walStart <= replayFloor was already
 	// delivered before the disconnect, i.e. it's a replay, not new data.
 	replayFloor         pq.LSN
+	lastXLogPos         pq.LSN
 	messageCloseOnce    sync.Once
 	connMu              sync.Mutex
 	closed              atomic.Bool
@@ -120,14 +151,6 @@ type stream struct {
 	processStarted      atomic.Bool
 	flushTickerStarted  atomic.Bool
 	openFromSnapshotLSN bool
-	// txCommit holds the commit context of the non-streamed transaction
-	// currently being decoded, so each of its change messages can be stamped
-	// with it. Written and read only on the sink (reader) goroutine.
-	txCommit struct {
-		time time.Time
-		lsn  pq.LSN
-		xid  uint32
-	}
 }
 
 func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
@@ -177,6 +200,34 @@ func (s *stream) Open(ctx context.Context) error {
 			return ErrorSlotInUse
 		}
 		return errors.Wrap(err, "replication setup")
+	}
+
+	// Opened after setup so the ErrorSlotInUse retry loop never churns guard
+	// connections; bound to this replication session (same host, same timeline).
+	if s.config.VisibilityGuard.Enabled {
+		guard, err := openVisibilityGuard(ctx, s.config.DSN(), s.config.VisibilityGuard, s.system.Timeline, s.metric)
+		if err != nil {
+			return errors.Wrap(err, "visibility guard")
+		}
+		s.guard = guard
+		logger.Info("visibility guard enabled",
+			"failMode", s.config.VisibilityGuard.FailMode,
+			"timeout", s.config.VisibilityGuard.Timeout,
+			"pollInterval", s.config.VisibilityGuard.PollInterval,
+		)
+		// Standbys share the guard's budget and failMode; they need the primary
+		// guard because P5 (sync rep + fail-closed) is what closes the timeline
+		// race the replica poll cannot see. See docs/replica-guard-design.md.
+		if len(s.config.VisibilityGuard.Replicas) > 0 {
+			replicas, err := openReplicaGuard(ctx, s.config, s.system, s.metric)
+			if err != nil {
+				_ = s.guard.close(ctx)
+				s.guard = nil
+				return errors.Wrap(err, "replica guard")
+			}
+			s.replicas = replicas
+			logger.Info("replica guard enabled", "replicas", s.config.VisibilityGuard.Replicas)
+		}
 	}
 
 	s.sinkStarted.Store(true)
@@ -328,9 +379,11 @@ func (s *stream) resetForReconnect() {
 // All preceding messages are emitted immediately with their original position.
 // This keeps memory usage O(1) regardless of transaction size.
 type messageBuffer struct {
-	pending *Message
-	outCh   chan<- *Message
-	ctx     context.Context
+	pending   *Message
+	outCh     chan<- *Message
+	ctx       context.Context
+	xid       uint32 // current transaction, from Begin
+	commitLSN pq.LSN // current transaction's commit record, from Begin.FinalLSN
 }
 
 func (b *messageBuffer) send(msg *Message) bool {
@@ -361,8 +414,10 @@ func (b *messageBuffer) flushWithLSN(lsn pq.LSN) {
 	if b.pending != nil {
 		markLastInTransaction(b.pending.message)
 		if !b.send(&Message{
-			message:  b.pending.message,
-			walStart: int64(lsn),
+			message:   b.pending.message,
+			walStart:  int64(lsn),
+			xid:       b.pending.xid,
+			commitLSN: b.pending.commitLSN,
 		}) {
 			return
 		}
@@ -394,26 +449,54 @@ func (b *messageBuffer) buffer(msg *Message) {
 // how PostgreSQL's own logical replication worker handles streaming: it writes
 // to temporary storage and only applies on commit.
 type streamTxBuffer struct {
-	ctx       context.Context
-	txns      map[uint32][]*Message
+	ctx  context.Context
+	txns map[uint32][]*Message
+	// subXacts records, per top-level XID, every sub-transaction XID in the
+	// order it first appeared together with the txns index of its first
+	// message. STREAM ABORT for a sub-transaction truncates txns at that
+	// index, mirroring PostgreSQL's worker.c stream_abort_internal.
+	subXacts  map[uint32][]subXact
 	activeXid uint32
 	streaming bool
+}
+
+type subXact struct {
+	xid   uint32
+	index int
 }
 
 // startTx marks the beginning of a streaming chunk for the given XID.
 func (s *streamTxBuffer) startTx(xid uint32) {
 	if s.txns == nil {
 		s.txns = make(map[uint32][]*Message)
+		s.subXacts = make(map[uint32][]subXact)
 	}
 	s.activeXid = xid
 	s.streaming = true
 }
 
 // append adds a message to the currently active streaming transaction.
-func (s *streamTxBuffer) append(msg *Message) {
-	if msg != nil {
-		s.txns[s.activeXid] = append(s.txns[s.activeXid], msg)
+// xid is the (sub)transaction the message was decoded with; a value other
+// than the active top-level XID marks a sub-transaction.
+func (s *streamTxBuffer) append(msg *Message, xid uint32) {
+	if msg == nil {
+		return
 	}
+	if xid != s.activeXid && !s.hasSubXact(xid) {
+		s.subXacts[s.activeXid] = append(s.subXacts[s.activeXid], subXact{xid: xid, index: len(s.txns[s.activeXid])})
+	}
+	s.txns[s.activeXid] = append(s.txns[s.activeXid], msg)
+}
+
+func (s *streamTxBuffer) hasSubXact(xid uint32) bool {
+	subs := s.subXacts[s.activeXid]
+	// Scan from the tail: a message almost always belongs to the most recent sub-transaction.
+	for i := len(subs) - 1; i >= 0; i-- {
+		if subs[i].xid == xid {
+			return true
+		}
+	}
+	return false
 }
 
 // stopTx marks the end of the current streaming chunk.
@@ -425,19 +508,23 @@ func (s *streamTxBuffer) stopTx() {
 // The last message's WAL position is rewritten to the transaction-end LSN
 // (endLSN). Every message is stamped with commitLSN, the commit record's own
 // LSN, matching what BEGIN.FinalLSN supplies on the non-streamed path -- the
-// two positions are not the same value.
+// two positions are not the same value. The wrapper also stores commitLSN so
+// the visibility guard and ListenerContext can read it without type-switching.
 func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN, commitLSN pq.LSN, commitTime time.Time) {
 	s.streaming = false
 	msgs := s.txns[xid]
 	n := len(msgs)
 	for i, msg := range msgs {
 		stampCommit(msg.message, commitTime, commitLSN, xid)
+		msg.commitLSN = commitLSN
 		out := msg
 		if i == n-1 {
 			markLastInTransaction(msg.message)
 			out = &Message{
-				message:  msg.message,
-				walStart: int64(endLSN),
+				message:   msg.message,
+				walStart:  int64(endLSN),
+				xid:       msg.xid,
+				commitLSN: commitLSN,
 			}
 		}
 		ctx := s.ctx
@@ -451,24 +538,47 @@ func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN, comm
 		}
 	}
 	delete(s.txns, xid)
+	delete(s.subXacts, xid)
 }
 
-// discardTx drops all accumulated messages for the given XID without emitting.
-func (s *streamTxBuffer) discardTx(xid uint32) {
+// abortTx handles STREAM ABORT. subXid == xid rolls back the whole
+// transaction. Otherwise only the sub-transaction is rolled back: every
+// message from its first appearance onwards is dropped (later sub-transactions
+// are nested in or follow it, so they are gone too); messages before it stay.
+func (s *streamTxBuffer) abortTx(xid, subXid uint32) {
 	s.streaming = false
-	delete(s.txns, xid)
+	// A top-level abort discards the whole transaction. PostgreSQL sets
+	// SubXid equal to Xid for that case. A zero SubXid is the same outcome:
+	// the abort did not name a subtransaction, so the buffered changes for
+	// the transaction are dropped. A distinct SubXid rolls back only that
+	// subtransaction and keeps the parent transaction's earlier rows.
+	if subXid == 0 || subXid == xid {
+		delete(s.txns, xid)
+		delete(s.subXacts, xid)
+		return
+	}
+	subs := s.subXacts[xid]
+	for i := len(subs) - 1; i >= 0; i-- {
+		if subs[i].xid == subXid {
+			s.txns[xid] = s.txns[xid][:subs[i].index]
+			s.subXacts[xid] = subs[:i]
+			return
+		}
+	}
+	// Unknown sub-transaction: none of its changes reached us, nothing to drop.
 }
 
 func (s *stream) sink(ctx context.Context) {
 	logger.Info("postgres message sink started")
 
-	var corrupted bool
+	var stop error
 	for {
 		buf := &messageBuffer{outCh: s.messageCH, ctx: ctx}
 		streamBuf := &streamTxBuffer{ctx: ctx}
-		corrupted = s.sinkLoop(ctx, buf, streamBuf)
+		var retryable bool
+		retryable, stop = s.sinkLoop(ctx, buf, streamBuf)
 
-		if !corrupted || s.closed.Load() || !s.config.Reconnect.Enabled {
+		if stop == nil || s.closed.Load() || !retryable || !s.config.Reconnect.Enabled {
 			break
 		}
 		if !s.reconnect(ctx) {
@@ -491,10 +601,10 @@ func (s *stream) sink(ctx context.Context) {
 		if err := s.Close(closeCtx); err != nil {
 			logger.Error("replication stream shutdown failed", "error", err)
 		}
-		if corrupted {
+		if stop != nil {
 			// Buffered by 1 and sent at most once per stream, so this never
 			// blocks even if nothing is listening on Err().
-			s.fatalCh <- ErrStreamCorrupted
+			s.fatalCh <- stop
 		}
 	}
 }
@@ -591,9 +701,10 @@ func (s *stream) reconnect(ctx context.Context) bool {
 }
 
 // sinkLoop reads raw replication messages and dispatches them until the
-// connection is closed or a fatal error occurs. It returns true when the
-// connection is in a corrupted state and the caller should panic.
-func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (corrupted bool) {
+// connection is closed or a fatal error occurs. A non-nil stop is reported
+// on Err(). retryable is set only for a lost connection, which a new
+// connection can repair. A message that cannot be decoded is not retryable.
+func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (retryable bool, stop error) {
 	for {
 		msgCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), time.Now().Add(300*time.Millisecond))
 		// Hold connMu only for the read itself. ReceiveMessage's deferred Unwatch
@@ -609,12 +720,12 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		if err != nil {
 			if s.closed.Load() {
 				logger.Info("stream stopped")
-				return false
+				return false, nil
 			}
 			if handleReplicationConnectionTermination(err) {
-				// Connection is gone while we are still running. Close and panic
-				// so the process restarts with a fresh replication connection.
-				return true
+				// The connection is gone while the stream is still running.
+				// The caller reconnects, or reports the error and stops.
+				return true, ErrStreamCorrupted
 			}
 			if pgconn.Timeout(err) {
 				if s.LoadXLogPos() > 0 {
@@ -622,14 +733,14 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 						if !handleReplicationConnectionTermination(err) {
 							logger.Error("send stand by status update", "error", err)
 						}
-						return true
+						return true, ErrStreamCorrupted
 					}
 					logger.Debug("send stand by status update")
 				}
 				continue
 			}
 			logger.Error("receive message error", "error", err)
-			return true
+			return true, ErrStreamCorrupted
 		}
 
 		copyData, ok := s.extractCopyData(rawMsg)
@@ -641,10 +752,12 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		case message.PrimaryKeepaliveMessageByteID:
 			if err := s.handleKeepalive(ctx, copyData.Data[1:]); err != nil {
 				handleReplicationConnectionTermination(err)
-				return true
+				return true, ErrStreamCorrupted
 			}
 		case message.XLogDataByteID:
-			s.handleXLogData(copyData.Data[1:], buf, streamBuf)
+			if err := s.handleXLogData(copyData.Data[1:], buf, streamBuf); err != nil {
+				return false, err
+			}
 		}
 	}
 }
@@ -695,12 +808,14 @@ func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
 }
 
 // handleXLogData parses a WAL data message, decodes the logical replication
-// event, and dispatches it through the message buffer.
-func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) {
+// event, and dispatches it through the message buffer. A decode failure
+// returns ErrUndecodableMessage and does not move the received position.
+func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) error {
 	xld, err := ParseXLogData(data)
 	if err != nil {
+		err = undecodableMessage(0, err)
 		logger.Error("parse xLog data", "error", err)
-		return
+		return err
 	}
 
 	logger.Debug("wal received",
@@ -710,14 +825,15 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 		"serverTime", xld.ServerTime,
 	)
 
-	s.UpdateXLogPos(xld.ServerWALEnd)
-	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
-
 	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation, s.config.SkipTupleMapDecode)
 	if err != nil || decodedMsg == nil {
-		logger.Debug("wal data message parsing error", "error", err)
-		return
+		err = undecodableMessage(xld.WALStart, err)
+		logger.Error("wal data message parsing error", "error", err, "walStart", xld.WALStart.String())
+		return err
 	}
+
+	s.UpdateXLogPos(xld.ServerWALEnd)
+	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
 
 	// add LSN to insert/update/delete messages
 	switch m := decodedMsg.(type) {
@@ -738,6 +854,20 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	}
 
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
+	return nil
+}
+
+// undecodableMessage marks err as a WAL record this process cannot decode.
+// The caller stops the stream. The confirmed position stays where it is, so
+// the record is read again after the process starts again.
+func undecodableMessage(walStart pq.LSN, err error) error {
+	if err == nil {
+		err = goerrors.New("decoded message is nil")
+	}
+	if walStart == 0 {
+		return fmt.Errorf("%w: %w", ErrUndecodableMessage, err)
+	}
+	return fmt.Errorf("%w at %s: %w", ErrUndecodableMessage, walStart, err)
 }
 
 // commitLSNOf returns a DML message's stamped CommitLSN, or 0 for message
@@ -793,7 +923,8 @@ func markLastInTransaction(msg any) {
 //
 // For streaming transactions (proto v2) messages are accumulated in the
 // streamTxBuffer across STREAM START / STREAM STOP chunks. They are only
-// emitted to the consumer on STREAM COMMIT and discarded on STREAM ABORT.
+// emitted to the consumer on STREAM COMMIT and discarded on STREAM ABORT
+// (whole transaction or, for a sub-transaction abort, only its own changes).
 // This prevents uncommitted data from being delivered.
 func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
 	switch msg := decodedMsg.(type) {
@@ -802,6 +933,8 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		s.txCommit.lsn = msg.FinalLSN
 		s.txCommit.xid = msg.Xid
 		buf.discard()
+		buf.xid = msg.Xid
+		buf.commitLSN = msg.FinalLSN
 
 	case *format.Commit:
 		buf.flushWithLSN(msg.TransactionEndLSN)
@@ -820,8 +953,9 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN, msg.CommitLSN, msg.CommitTime)
 
 	case *format.StreamAbort:
-		// Streamed transaction rolled back – discard messages for this XID.
-		streamBuf.discardTx(msg.Xid)
+		// Whole transaction (SubXid == Xid) or a single sub-transaction
+		// (ROLLBACK TO SAVEPOINT, plpgsql EXCEPTION block) rolled back.
+		streamBuf.abortTx(msg.Xid, msg.SubXid)
 
 	default:
 		// DML event (Insert, Update, Delete, Relation, …)
@@ -830,28 +964,86 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 			walStart: int64(xld.WALStart),
 		}
 		if streamBuf.streaming {
-			streamBuf.append(m)
+			m.xid = streamBuf.activeXid
+			streamBuf.append(m, messageXid(decodedMsg))
 		} else {
+			m.xid = buf.xid
+			m.commitLSN = buf.commitLSN
 			buf.buffer(m)
 		}
 	}
 }
 
+// messageXid returns the (sub)transaction XID a streamed message was decoded
+// with (proto v2 prefixes every message inside STREAM START/STOP with it).
+func messageXid(msg any) uint32 {
+	switch m := msg.(type) {
+	case *format.Insert:
+		return m.XID
+	case *format.Update:
+		return m.XID
+	case *format.Delete:
+		return m.XID
+	case *format.Truncate:
+		return m.XID
+	case *format.Relation:
+		return m.XID
+	}
+	return 0
+}
+
 func (s *stream) process(ctx context.Context) {
 	logger.Info("postgres message process started")
-	defer func() {
-		s.processEnd <- struct{}{}
-	}()
+	err := s.processLoop(ctx)
+	s.processEnd <- struct{}{}
+	if err == nil || s.closed.Load() {
+		return
+	}
+
+	// Same restart path as the sink's corrupted connection: shut the stream
+	// down (flushing the confirmed LSN) and report the error on Err(). The
+	// host restarts with fresh connections. The gated message was never
+	// acked, so it is redelivered. The error is reported instead of panicking,
+	// because a panic in this goroutine kills the host process.
+	logger.Error("visibility guard failed, restarting stream", "error", err)
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), streamShutdownTimeout)
+	defer cancel()
+	if cErr := s.Close(closeCtx); cErr != nil {
+		logger.Error("replication stream shutdown failed", "error", cErr)
+	}
+	select {
+	case s.fatalCh <- err:
+	default:
+	}
+}
+
+// processLoop delivers messages to the listener until the context is done or
+// the message channel is closed. It returns an error only when the visibility
+// guard can no longer certify visibility (failMode: closed, or a guard error).
+//
+// Everything in messageCH is committed on the server as long as two_phase is
+// off: ReorderBufferCommit is reached only from DecodeCommit, and this library
+// never requests two_phase. The gate therefore only waits for the commit to
+// become visible, never for it to happen.
+func (s *stream) processLoop(ctx context.Context) error {
+	// The transaction gated last, as (xid, commitLSN): xid alone repeats after
+	// wraparound, the pair never does. gated is false until the first gate so
+	// that a zero pair is never mistaken for "already gated".
+	var lastGated struct {
+		commitLSN pq.LSN
+		xid       uint32
+		gated     bool
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("postgres message process stopped")
-			return
+			return nil
 		case msg, ok := <-s.messageCH:
 			if !ok {
 				logger.Info("postgres message process stopped")
-				return
+				return nil
 			}
 			if msg == nil {
 				continue
@@ -863,7 +1055,8 @@ func (s *stream) process(ctx context.Context) {
 			// Sending it here per message serializes every ack behind the sink's
 			// connMu-held read, collapsing throughput to a few messages/sec while
 			// a buffered transaction is drained.
-			ackLSNFunc := func(lsn pq.LSN) error {
+			// AckLSN's signature returns error. This ack only updates memory.
+			ackLSNFunc := func(lsn pq.LSN) error { //nolint:unparam
 				s.UpdateConfirmedXLogPos(lsn)
 				s.updateUnackedLagMetric()
 				return nil
@@ -879,13 +1072,32 @@ func (s *stream) process(ctx context.Context) {
 				continue
 			}
 
+			// Gate once per transaction, on its first message.
+			if s.guard != nil && (!lastGated.gated || msg.xid != lastGated.xid || msg.commitLSN != lastGated.commitLSN) {
+				if err := s.gate(ctx, msg.xid, msg.commitLSN); err != nil {
+					if ctx.Err() != nil {
+						// Shutting down mid-wait: never dispatch an uncertified message.
+						// It stays un-acked and is redelivered after restart.
+						logger.Info("postgres message process stopped")
+						return nil
+					}
+					return err
+				}
+				lastGated.xid, lastGated.commitLSN, lastGated.gated = msg.xid, msg.commitLSN, true
+			}
+
+			commitLSN := msg.commitLSN
+			if commitLSN == 0 {
+				commitLSN = commitLSNOf(msg.message)
+			}
 			lCtx := &ListenerContext{
 				Context:   ctx,
 				Message:   msg.message,
 				WALStart:  pq.LSN(msg.walStart),
-				CommitLSN: commitLSNOf(msg.message),
+				CommitLSN: commitLSN,
 				Ack:       ackFunc,
 				AckLSN:    ackLSNFunc,
+				Xid:       msg.xid,
 			}
 
 			if pq.LSN(msg.walStart) <= s.loadReplayFloor() {
@@ -906,6 +1118,38 @@ func (s *stream) process(ctx context.Context) {
 			s.listenerFunc(lCtx)
 			s.metric.SetProcessLatency(time.Since(start).Nanoseconds())
 		}
+	}
+}
+
+// gate waits until xid is visible on the primary and, when replicas are
+// configured, until every listed standby has replayed commitLSN; both waits
+// share one deadline of visibilityGuard.timeout from the start of the gate.
+// A timeout is fatal under failMode closed and a logged, counted pass-through
+// under failMode open; any other guard error is fatal in both modes.
+func (s *stream) gate(ctx context.Context, xid uint32, commitLSN pq.LSN) error {
+	if xid == 0 || commitLSN == 0 {
+		// Every decoded BEGIN / STREAM COMMIT carries a valid xid and the commit
+		// record's LSN; snapshot events, the only messages without them, never
+		// pass through here (connector.snapshotHandler). A zero here means the
+		// message was decoded without its BEGIN, so nothing can be certified:
+		// fail closed instead of gating xid 0 and skipping the standbys.
+		return fmt.Errorf("%w: message without a decoded BEGIN (xid %d, commitLSN %s)", ErrVisibilityGuard, xid, commitLSN)
+	}
+	start := time.Now()
+	err := s.guard.wait(ctx, xid)
+	if err == nil && s.replicas != nil {
+		err = s.replicas.wait(ctx, xid, commitLSN, start.Add(s.config.VisibilityGuard.Timeout))
+	}
+	s.metric.ObserveVisibilityWait(time.Since(start))
+	switch {
+	case err == nil:
+		return nil
+	case goerrors.Is(err, ErrVisibilityTimeout) && s.config.VisibilityGuard.FailMode == config.VisibilityFailOpen:
+		logger.Warn("visibility guard timeout, dispatching anyway (failMode: open)", "xid", xid, "error", err)
+		s.metric.VisibilityFailOpenIncrement()
+		return nil
+	default:
+		return fmt.Errorf("%w: %w", ErrVisibilityGuard, err)
 	}
 }
 
@@ -940,10 +1184,16 @@ func (s *stream) Close(ctx context.Context) error {
 	}
 	var errs []error
 
-	// Close the PostgreSQL socket first. A listener callback is synchronous and
-	// may be blocked outside this package; waiting for it before closing the
-	// socket can leave the walsender connection open for the whole shutdown
-	// timeout.
+	// Cancel first so a process goroutine blocked in the visibility guard (or a
+	// context-aware listener) returns instead of waiting out its timeout.
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	// Close the PostgreSQL socket before waiting on the goroutines. A listener
+	// callback is synchronous and may be blocked outside this package; waiting
+	// for it before closing the socket can leave the walsender connection open
+	// for the whole shutdown timeout.
 	s.connMu.Lock()
 	if !s.conn.IsClosed() {
 		s.flushFinalStandbyStatusUpdateLocked(ctx)
@@ -953,9 +1203,6 @@ func (s *stream) Close(ctx context.Context) error {
 		logger.Info("postgres connection closed")
 	}
 	s.connMu.Unlock()
-	if s.cancel != nil {
-		s.cancel()
-	}
 
 	if s.sinkStarted.Load() {
 		select {
@@ -985,6 +1232,21 @@ func (s *stream) Close(ctx context.Context) error {
 			logger.Warn("timed out waiting for postgres flush ticker", "error", ctx.Err())
 			errs = append(errs, errors.Wrap(ctx.Err(), "wait for postgres flush ticker"))
 		}
+	}
+
+	// Only the process goroutine uses the guard connection; close it after that
+	// goroutine has stopped so the close never races an in-flight poll.
+	if s.guard != nil {
+		if err := s.guard.close(ctx); err != nil {
+			errs = append(errs, errors.Wrap(err, "close visibility guard"))
+		}
+		logger.Info("visibility guard connection closed")
+	}
+	if s.replicas != nil {
+		if err := s.replicas.close(ctx); err != nil {
+			errs = append(errs, errors.Wrap(err, "close replica guard"))
+		}
+		logger.Info("replica guard connections closed")
 	}
 
 	return goerrors.Join(errs...)
@@ -1084,12 +1346,6 @@ func (s *stream) updateDeliveredHighWaterMark(l pq.LSN) {
 	if s.deliveredHighWaterMark < l {
 		s.deliveredHighWaterMark = l
 	}
-}
-
-func (s *stream) loadDeliveredHighWaterMark() pq.LSN {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.deliveredHighWaterMark
 }
 
 // markReplayFloor records the current delivered high-water mark as the

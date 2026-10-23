@@ -13,6 +13,8 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
 )
 
+const publicSchema = "public"
+
 /*
 Simulation guide (low-traffic DB + high-traffic other DB)
 =========================================================
@@ -87,12 +89,12 @@ func main() {
 				{
 					Name:            "users",
 					ReplicaIdentity: publication.ReplicaIdentityDefault,
-					Schema:          "public",
+					Schema:          publicSchema,
 				},
 				{
 					Name:            "test_heartbeat_table",
 					ReplicaIdentity: publication.ReplicaIdentityDefault,
-					Schema:          "public",
+					Schema:          publicSchema,
 				},
 			},
 		},
@@ -104,7 +106,7 @@ func main() {
 		Heartbeat: config.HeartbeatConfig{
 			Table: publication.Table{
 				Name:   "test_heartbeat_table",
-				Schema: "public",
+				Schema: publicSchema,
 			},
 			// Interval defaults to 100ms if not specified
 		},

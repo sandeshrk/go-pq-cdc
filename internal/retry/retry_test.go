@@ -7,6 +7,7 @@ import (
 
 	"github.com/avast/retry-go/v4"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // sentinel errors distinguished by the If predicate in tests below.
@@ -34,7 +35,7 @@ func TestConfigDoHonorsIf(t *testing.T) {
 			return 0, errRetryable
 		})
 
-		assert.ErrorIs(t, err, errNotRetryable)
+		require.ErrorIs(t, err, errNotRetryable)
 		assert.Equal(t, 2, calls, "should stop the attempt where If first returns false")
 	})
 
@@ -53,7 +54,7 @@ func TestConfigDoHonorsIf(t *testing.T) {
 			return 0, errRetryable
 		})
 
-		assert.ErrorIs(t, err, errRetryable)
+		require.ErrorIs(t, err, errRetryable)
 		assert.Equal(t, 3, calls, "should exhaust all attempts when If keeps returning true")
 	})
 }
@@ -73,7 +74,7 @@ func TestConfigDoWithoutIfRetriesEveryError(t *testing.T) {
 		return 0, errNotRetryable
 	})
 
-	assert.ErrorIs(t, err, errNotRetryable)
+	require.ErrorIs(t, err, errNotRetryable)
 	assert.Equal(t, 4, calls, "with no If predicate, every error should be retried up to Attempts")
 }
 
@@ -93,7 +94,7 @@ func TestOnErrorConfigMatchesConnectSemantics(t *testing.T) {
 		return 0, errNotRetryable
 	})
 
-	assert.ErrorIs(t, err, errNotRetryable)
+	require.ErrorIs(t, err, errNotRetryable)
 	assert.Equal(t, 3, calls)
 	assert.Nil(t, cfg.If, "connect() passes nil: no RetryIf predicate should be set")
 	assert.Less(t, time.Since(start), time.Second, "test should not depend on the real 1s default delay")

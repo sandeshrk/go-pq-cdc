@@ -628,13 +628,13 @@ func TestReconnectConfigValidate(t *testing.T) {
 	t.Run("rejects negative durations", func(t *testing.T) {
 		tests := []struct {
 			name string
-			cfg  ReconnectConfig
 			want string
+			cfg  ReconnectConfig
 		}{
-			{"initialDelay", ReconnectConfig{InitialDelay: -1}, "reconnect.initialDelay cannot be negative"},
-			{"maxDelay", ReconnectConfig{MaxDelay: -1}, "reconnect.maxDelay cannot be negative"},
-			{"maxJitter", ReconnectConfig{MaxJitter: -1}, "reconnect.maxJitter cannot be negative"},
-			{"maxElapsed", ReconnectConfig{MaxElapsed: -1}, "reconnect.maxElapsed cannot be negative"},
+			{name: "initialDelay", cfg: ReconnectConfig{InitialDelay: -1}, want: "reconnect.initialDelay cannot be negative"},
+			{name: "maxDelay", cfg: ReconnectConfig{MaxDelay: -1}, want: "reconnect.maxDelay cannot be negative"},
+			{name: "maxJitter", cfg: ReconnectConfig{MaxJitter: -1}, want: "reconnect.maxJitter cannot be negative"},
+			{name: "maxElapsed", cfg: ReconnectConfig{MaxElapsed: -1}, want: "reconnect.maxElapsed cannot be negative"},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -737,5 +737,63 @@ func TestValidateHeartbeatInPublication(t *testing.T) {
 		err := cfg.ValidateHeartbeatInPublication(pubInfo)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), `publication "pub"`)
+	})
+}
+
+func TestVisibilityGuardConfig(t *testing.T) {
+	t.Run("disabled needs nothing", func(t *testing.T) {
+		cfg := Config{}
+		cfg.SetDefault()
+		require.NoError(t, cfg.VisibilityGuard.Validate())
+		assert.Equal(t, VisibilityGuardConfig{}, cfg.VisibilityGuard)
+	})
+
+	t.Run("enabled gets closed/10s/5ms defaults", func(t *testing.T) {
+		cfg := Config{VisibilityGuard: VisibilityGuardConfig{Enabled: true}}
+		cfg.SetDefault()
+		assert.Equal(t, VisibilityGuardConfig{Enabled: true, FailMode: VisibilityFailClosed, Timeout: 10 * time.Second, PollInterval: 5 * time.Millisecond}, cfg.VisibilityGuard)
+		require.NoError(t, cfg.VisibilityGuard.Validate())
+	})
+
+	t.Run("rejects unknown failMode and non-positive durations", func(t *testing.T) {
+		cfg := VisibilityGuardConfig{Enabled: true, FailMode: "half", Timeout: -time.Second, PollInterval: 0}
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "failMode")
+		require.ErrorContains(t, err, "timeout")
+		require.ErrorContains(t, err, "pollInterval")
+	})
+
+	t.Run("wired into Config.Validate", func(t *testing.T) {
+		cfg := Config{
+			Host: "h", Username: "u", Password: "p", Database: "d",
+			Publication:     publication.Config{Name: "pub", Tables: publication.Tables{{Name: "t", Schema: "public", ReplicaIdentity: "FULL"}}, Operations: publication.Operations{publication.OperationInsert}},
+			Slot:            slot.Config{Name: "slot"},
+			VisibilityGuard: VisibilityGuardConfig{Enabled: true, FailMode: "half", Timeout: time.Second, PollInterval: time.Millisecond},
+		}
+		require.ErrorContains(t, cfg.Validate(), "visibilityGuard.failMode")
+	})
+}
+
+func TestVisibilityGuardReplicasConfig(t *testing.T) {
+	t.Run("requires the primary guard", func(t *testing.T) {
+		cfg := VisibilityGuardConfig{Replicas: []string{"standby1:5432"}}
+		require.ErrorContains(t, cfg.Validate(), "requires visibilityGuard.enabled")
+	})
+
+	t.Run("host:port only, no duplicates", func(t *testing.T) {
+		cfg := VisibilityGuardConfig{Enabled: true, FailMode: VisibilityFailClosed, Timeout: time.Second, PollInterval: time.Millisecond,
+			Replicas: []string{"standby1", "standby2:5432", "standby2:5432"}}
+		err := cfg.Validate()
+		require.ErrorContains(t, err, `"standby1" must be host:port`)
+		require.ErrorContains(t, err, `"standby2:5432" listed twice`)
+	})
+
+	t.Run("valid list and ReplicaDSN", func(t *testing.T) {
+		cfg := Config{Username: "u", Password: "p@ss", Database: "d", Host: "primary", Port: 5432,
+			VisibilityGuard: VisibilityGuardConfig{Enabled: true, Replicas: []string{"standby1:5432", "[::1]:5433"}}}
+		cfg.SetDefault()
+		require.NoError(t, cfg.VisibilityGuard.Validate())
+		assert.Equal(t, "postgres://u:p%40ss@standby1:5432/d", cfg.ReplicaDSN("standby1:5432"))
+		assert.Equal(t, "postgres://u:p%40ss@[::1]:5433/d", cfg.ReplicaDSN("[::1]:5433"))
 	})
 }

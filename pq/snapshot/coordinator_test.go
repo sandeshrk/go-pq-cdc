@@ -8,9 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-//go:fix inline
-func ptrInt64(v int64) *int64 { return new(v) }
-
 func TestAndCondition(t *testing.T) {
 	t.Run("both empty returns empty", func(t *testing.T) {
 		assert.Empty(t, andCondition("", ""))
@@ -91,6 +88,20 @@ func TestGetQueryCondition(t *testing.T) {
 	})
 }
 
+func TestBuildPrimaryKeyBoundsQueryWithCondition(t *testing.T) {
+	s := &Snapshotter{
+		config: config.SnapshotConfig{QueryCondition: "deleted_at IS NULL"},
+	}
+
+	query := s.buildPrimaryKeyBoundsQuery(publication.Table{
+		Schema: "public",
+		Name:   "users",
+	}, "id")
+
+	assert.Contains(t, query, `FROM "public"."users"`)
+	assert.Contains(t, query, "WHERE (deleted_at IS NULL)")
+}
+
 func TestBuildChunkQueryWithCondition(t *testing.T) {
 	s := &Snapshotter{}
 
@@ -99,8 +110,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
-			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(1000),
+			RangeStart:        new(int64(1)),
+			RangeEnd:          new(int64(1000)),
 			ChunkSize:         500,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "is_active = true")
@@ -113,8 +124,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
-			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(10),
+			RangeStart:        new(int64(1)),
+			RangeEnd:          new(int64(10)),
 			ChunkSize:         5,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "")
@@ -139,8 +150,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
-			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(1000),
+			RangeStart:        new(int64(1)),
+			RangeEnd:          new(int64(1000)),
 			ChunkSize:         500,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "status = 'a' OR status = 'b'")
@@ -164,8 +175,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
-			BlockStart:        ptrInt64(0),
-			BlockEnd:          ptrInt64(100),
+			BlockStart:        new(int64(0)),
+			BlockEnd:          new(int64(100)),
 		}
 		q := s.buildChunkQuery(chunk, "", nil, "tenant_id = 7")
 		assert.Contains(t, q, "WHERE ctid >= '(0,0)'::tid AND ctid < '(100,0)'::tid AND (tenant_id = 7)")
@@ -176,7 +187,7 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
-			BlockStart:        ptrInt64(50),
+			BlockStart:        new(int64(50)),
 			BlockEnd:          nil,
 			IsLastChunk:       true,
 		}
@@ -215,4 +226,112 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 		assert.Contains(t, q, "WHERE (is_active = true)")
 		assert.Contains(t, q, "ORDER BY id LIMIT 10")
 	})
+}
+
+func TestBuildChunkQueryUsesPhysicalPartition(t *testing.T) {
+	s := &Snapshotter{}
+
+	tests := []struct {
+		name    string
+		chunk   *Chunk
+		orderBy string
+		pk      []string
+	}{
+		{
+			name: "integer range",
+			chunk: &Chunk{
+				TableSchema:         "public",
+				TableName:           "events",
+				PhysicalTableSchema: "archive",
+				PhysicalTableName:   "events_2026_01",
+				PartitionStrategy:   PartitionStrategyIntegerRange,
+				RangeStart:          new(int64(1)),
+				RangeEnd:            new(int64(10)),
+				ChunkSize:           10,
+			},
+			orderBy: "id",
+			pk:      []string{"id"},
+		},
+		{
+			name: "ctid block",
+			chunk: &Chunk{
+				TableSchema:         "public",
+				TableName:           "events",
+				PhysicalTableSchema: "archive",
+				PhysicalTableName:   "events_2026_01",
+				PartitionStrategy:   PartitionStrategyCTIDBlock,
+				BlockStart:          new(int64(0)),
+				IsLastChunk:         true,
+			},
+		},
+		{
+			name: "offset",
+			chunk: &Chunk{
+				TableSchema:         "public",
+				TableName:           "events",
+				PhysicalTableSchema: "archive",
+				PhysicalTableName:   "events_2026_01",
+				PartitionStrategy:   PartitionStrategyOffset,
+				ChunkSize:           10,
+			},
+			orderBy: "id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query := s.buildChunkQuery(tt.chunk, tt.orderBy, tt.pk, "")
+			assert.Contains(t, query, `FROM "archive"."events_2026_01" AS "events"`)
+			assert.NotContains(t, query, `FROM "public"."events"`)
+		})
+	}
+}
+
+func TestQuoteQualifiedTableQuotesANameOnce(t *testing.T) {
+	assert.Equal(t, `"public"."events_EU"`, quoteQualifiedTable("public", "events_EU"))
+	assert.Equal(t, `"public"."events_EU"`, quoteQualifiedTable(`"public"`, `"events_EU"`))
+}
+
+func TestBuildChunkQueryQuotesMixedCaseLeafOnce(t *testing.T) {
+	s := &Snapshotter{}
+	chunk := &Chunk{
+		TableSchema:         "public",
+		TableName:           "events",
+		PhysicalTableSchema: "public",
+		PhysicalTableName:   "events_EU",
+		PartitionStrategy:   PartitionStrategyOffset,
+		ChunkSize:           10,
+	}
+
+	query := s.buildChunkQuery(chunk, "id", nil, "")
+	assert.Contains(t, query, `FROM "public"."events_EU" AS "events"`)
+	assert.NotContains(t, query, `""events_EU""`)
+
+	chunk.PhysicalTableSchema = `"public"`
+	chunk.PhysicalTableName = `"events_EU"`
+	query = s.buildChunkQuery(chunk, "id", nil, "")
+	assert.Contains(t, query, `FROM "public"."events_EU" AS "events"`)
+	assert.NotContains(t, query, `""events_EU""`)
+}
+
+func TestBuildChunkValueStringIncludesPhysicalPartition(t *testing.T) {
+	s := &Snapshotter{}
+	chunk := &Chunk{
+		SlotName:            "snapshot",
+		TableSchema:         "public",
+		TableName:           "events",
+		PhysicalTableSchema: "public",
+		PhysicalTableName:   "events_2026_01",
+		ChunkSize:           100,
+		Status:              ChunkStatusPending,
+		PartitionStrategy:   PartitionStrategyCTIDBlock,
+	}
+
+	value := s.buildChunkValueString(chunk)
+	assert.Contains(t, value, "'public', 'events', 'public', 'events_2026_01'")
+
+	chunk.PhysicalTableSchema = ""
+	chunk.PhysicalTableName = ""
+	value = s.buildChunkValueString(chunk)
+	assert.Contains(t, value, "'public', 'events', NULL, NULL")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	libpq "github.com/lib/pq"
 )
 
 var (
@@ -23,6 +25,10 @@ var (
 )
 
 var typeMap = pgtype.NewMap()
+
+// failoverMinServerVersion is the first server_version_num with
+// CREATE_REPLICATION_SLOT ... (FAILOVER true) and ALTER_REPLICATION_SLOT.
+const failoverMinServerVersion = 170000
 
 type XLogUpdater interface {
 	UpdateXLogPos(l pq.LSN)
@@ -71,6 +77,12 @@ func (s *Slot) Create(ctx context.Context) (*Info, error) {
 		_ = s.conn.Close(ctx)
 	}()
 
+	if s.cfg.Failover {
+		if err := s.checkFailoverSupportLocked(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	info, err := s.infoLocked(ctx)
 	if err != nil {
 		if !goerrors.Is(err, ErrorSlotIsNotExists) || !s.cfg.CreateIfNotExists {
@@ -78,20 +90,94 @@ func (s *Slot) Create(ctx context.Context) (*Info, error) {
 		}
 	} else {
 		logger.Warn("replication slot already exists")
+		if s.cfg.Failover {
+			if err := s.enableFailoverLocked(ctx, info); err != nil {
+				return nil, err
+			}
+		}
 		return info, nil
 	}
 
 	// Slot needs replication connection for CREATE_REPLICATION_SLOT command
-	if err := s.createSlotWithReplicationConn(ctx); err != nil {
-		return nil, err
+	sql := createReplicationSlotCommand(s.cfg.Name, s.cfg.Failover)
+	if err := s.execReplicationCommand(ctx, sql); err != nil {
+		return nil, errors.Wrap(err, "replication slot create")
 	}
 
-	logger.Info("replication slot created", "name", s.cfg.Name)
+	logger.Info("replication slot created", "name", s.cfg.Name, "failover", s.cfg.Failover)
 
 	return s.infoLocked(ctx)
 }
 
-func (s *Slot) createSlotWithReplicationConn(ctx context.Context) error {
+// checkFailoverSupportLocked rejects slot.failover on servers older than 17
+// with a clear error instead of a CREATE_REPLICATION_SLOT syntax error.
+func (s *Slot) checkFailoverSupportLocked(ctx context.Context) error {
+	raw, err := s.scalarLocked(ctx, "SHOW server_version_num")
+	if err != nil {
+		return errors.Wrap(err, "server version")
+	}
+	version, err := strconv.Atoi(raw)
+	if err != nil {
+		return errors.Wrapf(err, "server version %q", raw)
+	}
+	if version < failoverMinServerVersion {
+		return errors.Newf("slot.failover requires PostgreSQL 17 or newer (server_version_num %d)", version)
+	}
+	return nil
+}
+
+// enableFailoverLocked turns FAILOVER on for an existing slot created without
+// it. ALTER_REPLICATION_SLOT needs the slot to be free: while another
+// walsender holds it (rolling deployment) the ALTER is skipped with a warning
+// and retried by the next Create.
+func (s *Slot) enableFailoverLocked(ctx context.Context, info *Info) error {
+	failover, err := s.scalarLocked(ctx, fmt.Sprintf("SELECT failover FROM pg_replication_slots WHERE slot_name = '%s'", s.cfg.Name))
+	if err != nil {
+		return errors.Wrap(err, "replication slot failover flag")
+	}
+	if failover == "t" {
+		return nil
+	}
+	if info.Active {
+		logger.Warn("replication slot is active for another process, failover will be enabled once it is released", "name", s.cfg.Name, "activePID", info.ActivePID)
+		return nil
+	}
+	if err := s.execReplicationCommand(ctx, alterReplicationSlotFailoverCommand(s.cfg.Name)); err != nil {
+		return errors.Wrap(err, "replication slot enable failover")
+	}
+	logger.Info("replication slot failover enabled", "name", s.cfg.Name)
+	return nil
+}
+
+// scalarLocked runs sql on the regular connection and returns the first
+// column of the first row as text.
+func (s *Slot) scalarLocked(ctx context.Context, sql string) (string, error) {
+	results, err := s.conn.Exec(ctx, sql).ReadAll()
+	if err != nil {
+		return "", err
+	}
+	if len(results) == 0 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
+		return "", errors.Newf("no rows: %s", sql)
+	}
+	return string(results[0].Rows[0][0]), nil
+}
+
+func createReplicationSlotCommand(name string, failover bool) string {
+	sql := fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput", libpq.QuoteIdentifier(name))
+	if failover {
+		sql += " (FAILOVER true)"
+	}
+	return sql
+}
+
+func alterReplicationSlotFailoverCommand(name string) string {
+	return fmt.Sprintf("ALTER_REPLICATION_SLOT %s (FAILOVER true)", libpq.QuoteIdentifier(name))
+}
+
+// execReplicationCommand runs a replication-protocol command
+// (CREATE_REPLICATION_SLOT, ALTER_REPLICATION_SLOT) on a short-lived
+// replication connection.
+func (s *Slot) execReplicationCommand(ctx context.Context, sql string) error {
 	if err := s.replicationConn.Connect(ctx); err != nil {
 		return errors.Wrap(err, "slot replication connect")
 	}
@@ -99,17 +185,13 @@ func (s *Slot) createSlotWithReplicationConn(ctx context.Context) error {
 		_ = s.replicationConn.Close(ctx)
 	}()
 
-	sql := fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput", s.cfg.Name)
 	resultReader := s.replicationConn.Exec(ctx, sql)
-	_, err := resultReader.ReadAll()
-	if err != nil {
-		return errors.Wrap(err, "replication slot create result")
+	if _, err := resultReader.ReadAll(); err != nil {
+		return errors.Wrap(err, "result")
 	}
-
-	if err = resultReader.Close(); err != nil {
-		return errors.Wrap(err, "replication slot create result reader close")
+	if err := resultReader.Close(); err != nil {
+		return errors.Wrap(err, "result reader close")
 	}
-
 	return nil
 }
 
@@ -125,16 +207,40 @@ func (s *Slot) Info(ctx context.Context) (*Info, error) {
 }
 
 func (s *Slot) infoLocked(ctx context.Context) (*Info, error) {
-	// Callers poll this for the process lifetime, so re-dial here: without it a
-	// single dropped connection makes every later call fail with "conn closed".
-	if err := s.conn.Connect(ctx); err != nil {
-		return nil, errors.Wrap(err, "replication slot info connect")
+	// Callers poll this for the process lifetime, so re-dial a dropped
+	// connection before the query: without it every later call fails with
+	// "conn closed". Connect is a no-op when the connection is already open,
+	// so dial only when it is closed. A connection that dies during the query
+	// is retried once below.
+	if s.conn.IsClosed() {
+		if err := s.conn.Connect(ctx); err != nil {
+			return nil, errors.Wrap(err, "replication slot info connect")
+		}
 	}
 
-	resultReader := s.conn.Exec(ctx, s.statusSQL)
-	results, err := resultReader.ReadAll()
+	results, err := s.execStatusQueryLocked(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "replication slot info result")
+		// Self-heal only when pgconn marked the connection closed; real SQL or
+		// server errors must surface without a retry. Close() flips `closed`
+		// outside the mutex, so shutdown can start mid-query — bail out instead
+		// of reconnecting underneath it.
+		if s.closed.Load() {
+			return nil, ErrorSlotClosed
+		}
+		if !s.conn.IsClosed() {
+			return nil, err
+		}
+
+		logger.Warn("slot info connection closed, reconnecting", "name", s.cfg.Name, "error", err)
+
+		if connectErr := s.conn.Connect(ctx); connectErr != nil {
+			return nil, errors.Wrap(connectErr, "reconnect slot info connection")
+		}
+
+		results, err = s.execStatusQueryLocked(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(results) == 0 || results[0].CommandTag.String() == "SELECT 0" {
@@ -151,6 +257,16 @@ func (s *Slot) infoLocked(ctx context.Context) (*Info, error) {
 	}
 
 	return slotInfo, nil
+}
+
+// execStatusQueryLocked runs the slot status query once on the regular
+// connection.
+func (s *Slot) execStatusQueryLocked(ctx context.Context) ([]*pgconn.Result, error) {
+	results, err := s.conn.Exec(ctx, s.statusSQL).ReadAll()
+	if err != nil {
+		return nil, errors.Wrap(err, "replication slot info result")
+	}
+	return results, nil
 }
 
 func (s *Slot) Metrics(ctx context.Context) {
