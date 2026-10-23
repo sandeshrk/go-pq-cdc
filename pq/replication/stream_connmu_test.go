@@ -88,8 +88,9 @@ func TestStandbyUpdateIsSerializedWithReceive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
+	var sinkErr error
 	wg.Go(func() {
-		s.sinkLoop(ctx, &messageBuffer{outCh: make(chan *Message, 4096)}, &streamTxBuffer{})
+		_, sinkErr = s.sinkLoop(ctx, &messageBuffer{outCh: make(chan *Message, 4096)}, &streamTxBuffer{})
 	})
 
 	for range 4 {
@@ -103,12 +104,15 @@ func TestStandbyUpdateIsSerializedWithReceive(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Stop cleanly: closed=true makes the sink treat the next read error as a
-	// normal stop (returns false, no panic). Set closed before stop so it's
-	// observed by the time the read errors; cancel unblocks the ackers.
+	// normal stop. Set closed before stop so it's observed by the time the
+	// read errors; cancel unblocks the ackers.
 	s.closed.Store(true)
 	c.stop.Store(true)
 	cancel()
 	wg.Wait()
+	if sinkErr != nil {
+		t.Fatal(sinkErr)
+	}
 
 	if got := c.overlaps.Load(); got != 0 {
 		t.Fatalf("read and standby-update write overlapped %d time(s); connMu did not serialize connection access", got)

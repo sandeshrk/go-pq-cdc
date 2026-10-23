@@ -65,10 +65,10 @@ func TestHandleXLogDataStampsNonStreamedTransactionCommitContext(t *testing.T) {
 	buf := &messageBuffer{outCh: out}
 	streamBuf := &streamTxBuffer{}
 
-	s.handleXLogData(xlogDataFrame(1000, beginData), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(1100, insertData), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(1200, insertData), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(1300, commitData), buf, streamBuf)
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1000, beginData), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1100, insertData), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1200, insertData), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1300, commitData), buf, streamBuf))
 
 	require.Len(t, out, 2)
 	first := <-out
@@ -129,13 +129,13 @@ func TestHandleXLogDataResetsCommitContextBetweenTransactions(t *testing.T) {
 	buf := &messageBuffer{outCh: out}
 	streamBuf := &streamTxBuffer{}
 
-	s.handleXLogData(xlogDataFrame(1000, firstBegin), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(1100, insertData), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(1200, firstCommit), buf, streamBuf)
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1000, firstBegin), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1100, insertData), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(1200, firstCommit), buf, streamBuf))
 
-	s.handleXLogData(xlogDataFrame(2000, secondBegin), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(2100, insertData), buf, streamBuf)
-	s.handleXLogData(xlogDataFrame(2200, secondCommit), buf, streamBuf)
+	require.NoError(t, s.handleXLogData(xlogDataFrame(2000, secondBegin), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(2100, insertData), buf, streamBuf))
+	require.NoError(t, s.handleXLogData(xlogDataFrame(2200, secondCommit), buf, streamBuf))
 
 	require.Len(t, out, 2)
 	firstTxInsert := (<-out).message.(*format.Insert)

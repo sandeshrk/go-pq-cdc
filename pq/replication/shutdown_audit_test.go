@@ -186,7 +186,7 @@ func TestSinkLoopTreatsConnectionTerminationAsCorrupted(t *testing.T) {
 			stream := NewStream("", config.Config{}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
 			stream.conn = receiveErrConn{err: tt.err}
 
-			stop, retryable := stream.sinkLoop(
+			retryable, stop := stream.sinkLoop(
 				context.Background(),
 				&messageBuffer{outCh: make(chan *Message, 1)},
 				&streamTxBuffer{},
@@ -205,7 +205,7 @@ func TestSinkLoopDoesNotTreatTerminationAsCorruptedWhenAlreadyClosed(t *testing.
 	stream.conn = receiveErrConn{err: io.ErrUnexpectedEOF}
 	stream.closed.Store(true)
 
-	stop, retryable := stream.sinkLoop(
+	retryable, stop := stream.sinkLoop(
 		context.Background(),
 		&messageBuffer{outCh: make(chan *Message, 1)},
 		&streamTxBuffer{},

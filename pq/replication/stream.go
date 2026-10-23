@@ -576,7 +576,7 @@ func (s *stream) sink(ctx context.Context) {
 		buf := &messageBuffer{outCh: s.messageCH, ctx: ctx}
 		streamBuf := &streamTxBuffer{ctx: ctx}
 		var retryable bool
-		stop, retryable = s.sinkLoop(ctx, buf, streamBuf)
+		retryable, stop = s.sinkLoop(ctx, buf, streamBuf)
 
 		if stop == nil || s.closed.Load() || !retryable || !s.config.Reconnect.Enabled {
 			break
@@ -704,7 +704,7 @@ func (s *stream) reconnect(ctx context.Context) bool {
 // connection is closed or a fatal error occurs. A non-nil stop is reported
 // on Err(). retryable is set only for a lost connection, which a new
 // connection can repair. A message that cannot be decoded is not retryable.
-func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (stop error, retryable bool) {
+func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (retryable bool, stop error) {
 	for {
 		msgCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), time.Now().Add(300*time.Millisecond))
 		// Hold connMu only for the read itself. ReceiveMessage's deferred Unwatch
@@ -720,12 +720,12 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		if err != nil {
 			if s.closed.Load() {
 				logger.Info("stream stopped")
-				return nil, false
+				return false, nil
 			}
 			if handleReplicationConnectionTermination(err) {
 				// The connection is gone while the stream is still running.
 				// The caller reconnects, or reports the error and stops.
-				return ErrStreamCorrupted, true
+				return true, ErrStreamCorrupted
 			}
 			if pgconn.Timeout(err) {
 				if s.LoadXLogPos() > 0 {
@@ -733,14 +733,14 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 						if !handleReplicationConnectionTermination(err) {
 							logger.Error("send stand by status update", "error", err)
 						}
-						return ErrStreamCorrupted, true
+						return true, ErrStreamCorrupted
 					}
 					logger.Debug("send stand by status update")
 				}
 				continue
 			}
 			logger.Error("receive message error", "error", err)
-			return ErrStreamCorrupted, true
+			return true, ErrStreamCorrupted
 		}
 
 		copyData, ok := s.extractCopyData(rawMsg)
@@ -752,11 +752,11 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		case message.PrimaryKeepaliveMessageByteID:
 			if err := s.handleKeepalive(ctx, copyData.Data[1:]); err != nil {
 				handleReplicationConnectionTermination(err)
-				return ErrStreamCorrupted, true
+				return true, ErrStreamCorrupted
 			}
 		case message.XLogDataByteID:
 			if err := s.handleXLogData(copyData.Data[1:], buf, streamBuf); err != nil {
-				return err, false
+				return false, err
 			}
 		}
 	}

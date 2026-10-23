@@ -10,6 +10,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHandleXLogDataDoesNotAdvancePastUndecodableMessage(t *testing.T) {
@@ -22,7 +23,7 @@ func TestHandleXLogDataDoesNotAdvancePastUndecodableMessage(t *testing.T) {
 
 	t.Run("truncated header", func(t *testing.T) {
 		err := stream.handleXLogData([]byte{1, 2, 3}, &messageBuffer{outCh: out}, &streamTxBuffer{})
-		assert.ErrorIs(t, err, ErrUndecodableMessage)
+		require.ErrorIs(t, err, ErrUndecodableMessage)
 		assert.Equal(t, pq.LSN(0), stream.LoadXLogPos())
 		assert.Equal(t, confirmed, stream.LoadConfirmedXLogPos())
 	})
@@ -35,7 +36,7 @@ func TestHandleXLogDataDoesNotAdvancePastUndecodableMessage(t *testing.T) {
 		data[24] = 'Z'                                          // unsupported logical message
 
 		err := stream.handleXLogData(data, &messageBuffer{outCh: out}, &streamTxBuffer{})
-		assert.ErrorIs(t, err, ErrUndecodableMessage)
+		require.ErrorIs(t, err, ErrUndecodableMessage)
 		assert.Equal(t, pq.LSN(0), stream.LoadXLogPos())
 		assert.Equal(t, confirmed, stream.LoadConfirmedXLogPos())
 		select {
