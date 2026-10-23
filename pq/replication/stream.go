@@ -38,6 +38,11 @@ var (
 	// default), or its budget was exhausted. The replication stream is dead
 	// at that point; a caller must build a new connector/stream to recover.
 	ErrStreamCorrupted = goerrors.New("replication stream corrupted: connection lost and reconnect is disabled or exhausted")
+	// ErrUndecodableMessage is sent on Err() when a WAL record cannot be
+	// decoded. The confirmed position is left unchanged. A new stream reads
+	// the same record again. A new connection is not opened first: the bytes
+	// on the server are unchanged.
+	ErrUndecodableMessage = goerrors.New("replication message could not be decoded")
 )
 
 const (
@@ -566,13 +571,14 @@ func (s *streamTxBuffer) abortTx(xid, subXid uint32) {
 func (s *stream) sink(ctx context.Context) {
 	logger.Info("postgres message sink started")
 
-	var corrupted bool
+	var stop error
 	for {
 		buf := &messageBuffer{outCh: s.messageCH, ctx: ctx}
 		streamBuf := &streamTxBuffer{ctx: ctx}
-		corrupted = s.sinkLoop(ctx, buf, streamBuf)
+		var retryable bool
+		stop, retryable = s.sinkLoop(ctx, buf, streamBuf)
 
-		if !corrupted || s.closed.Load() || !s.config.Reconnect.Enabled {
+		if stop == nil || s.closed.Load() || !retryable || !s.config.Reconnect.Enabled {
 			break
 		}
 		if !s.reconnect(ctx) {
@@ -595,10 +601,10 @@ func (s *stream) sink(ctx context.Context) {
 		if err := s.Close(closeCtx); err != nil {
 			logger.Error("replication stream shutdown failed", "error", err)
 		}
-		if corrupted {
+		if stop != nil {
 			// Buffered by 1 and sent at most once per stream, so this never
 			// blocks even if nothing is listening on Err().
-			s.fatalCh <- ErrStreamCorrupted
+			s.fatalCh <- stop
 		}
 	}
 }
@@ -695,9 +701,10 @@ func (s *stream) reconnect(ctx context.Context) bool {
 }
 
 // sinkLoop reads raw replication messages and dispatches them until the
-// connection is closed or a fatal error occurs. It returns true when the
-// connection is in a corrupted state and the caller should panic.
-func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (corrupted bool) {
+// connection is closed or a fatal error occurs. A non-nil stop is reported
+// on Err(). retryable is set only for a lost connection, which a new
+// connection can repair. A message that cannot be decoded is not retryable.
+func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (stop error, retryable bool) {
 	for {
 		msgCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), time.Now().Add(300*time.Millisecond))
 		// Hold connMu only for the read itself. ReceiveMessage's deferred Unwatch
@@ -713,12 +720,12 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		if err != nil {
 			if s.closed.Load() {
 				logger.Info("stream stopped")
-				return false
+				return nil, false
 			}
 			if handleReplicationConnectionTermination(err) {
-				// Connection is gone while we are still running. Close and panic
-				// so the process restarts with a fresh replication connection.
-				return true
+				// The connection is gone while the stream is still running.
+				// The caller reconnects, or reports the error and stops.
+				return ErrStreamCorrupted, true
 			}
 			if pgconn.Timeout(err) {
 				if s.LoadXLogPos() > 0 {
@@ -726,14 +733,14 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 						if !handleReplicationConnectionTermination(err) {
 							logger.Error("send stand by status update", "error", err)
 						}
-						return true
+						return ErrStreamCorrupted, true
 					}
 					logger.Debug("send stand by status update")
 				}
 				continue
 			}
 			logger.Error("receive message error", "error", err)
-			return true
+			return ErrStreamCorrupted, true
 		}
 
 		copyData, ok := s.extractCopyData(rawMsg)
@@ -745,10 +752,12 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		case message.PrimaryKeepaliveMessageByteID:
 			if err := s.handleKeepalive(ctx, copyData.Data[1:]); err != nil {
 				handleReplicationConnectionTermination(err)
-				return true
+				return ErrStreamCorrupted, true
 			}
 		case message.XLogDataByteID:
-			s.handleXLogData(copyData.Data[1:], buf, streamBuf)
+			if err := s.handleXLogData(copyData.Data[1:], buf, streamBuf); err != nil {
+				return err, false
+			}
 		}
 	}
 }
@@ -799,12 +808,14 @@ func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
 }
 
 // handleXLogData parses a WAL data message, decodes the logical replication
-// event, and dispatches it through the message buffer.
-func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) {
+// event, and dispatches it through the message buffer. A decode failure
+// returns ErrUndecodableMessage and does not move the received position.
+func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) error {
 	xld, err := ParseXLogData(data)
 	if err != nil {
+		err = undecodableMessage(0, err)
 		logger.Error("parse xLog data", "error", err)
-		return
+		return err
 	}
 
 	logger.Debug("wal received",
@@ -814,14 +825,15 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 		"serverTime", xld.ServerTime,
 	)
 
-	s.UpdateXLogPos(xld.ServerWALEnd)
-	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
-
 	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation, s.config.SkipTupleMapDecode)
 	if err != nil || decodedMsg == nil {
-		logger.Debug("wal data message parsing error", "error", err)
-		return
+		err = undecodableMessage(xld.WALStart, err)
+		logger.Error("wal data message parsing error", "error", err, "walStart", xld.WALStart.String())
+		return err
 	}
+
+	s.UpdateXLogPos(xld.ServerWALEnd)
+	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
 
 	// add LSN to insert/update/delete messages
 	switch m := decodedMsg.(type) {
@@ -842,6 +854,20 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	}
 
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
+	return nil
+}
+
+// undecodableMessage marks err as a WAL record this process cannot decode.
+// The caller stops the stream. The confirmed position stays where it is, so
+// the record is read again after the process starts again.
+func undecodableMessage(walStart pq.LSN, err error) error {
+	if err == nil {
+		err = goerrors.New("decoded message is nil")
+	}
+	if walStart == 0 {
+		return fmt.Errorf("%w: %w", ErrUndecodableMessage, err)
+	}
+	return fmt.Errorf("%w at %s: %w", ErrUndecodableMessage, walStart, err)
 }
 
 // commitLSNOf returns a DML message's stamped CommitLSN, or 0 for message

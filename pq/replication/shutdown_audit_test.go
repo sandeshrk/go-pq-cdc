@@ -2,11 +2,13 @@ package replication
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq/message"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -183,13 +186,13 @@ func TestSinkLoopTreatsConnectionTerminationAsCorrupted(t *testing.T) {
 			stream := NewStream("", config.Config{}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
 			stream.conn = receiveErrConn{err: tt.err}
 
-			corrupted := stream.sinkLoop(
+			stop, retryable := stream.sinkLoop(
 				context.Background(),
 				&messageBuffer{outCh: make(chan *Message, 1)},
 				&streamTxBuffer{},
 			)
-			if !corrupted {
-				t.Fatal("expected connection termination while running to be treated as corrupted so the process restarts")
+			if !errors.Is(stop, ErrStreamCorrupted) || !retryable {
+				t.Fatalf("expected a retryable corrupted stream, got stop=%v retryable=%v", stop, retryable)
 			}
 		})
 	}
@@ -202,13 +205,51 @@ func TestSinkLoopDoesNotTreatTerminationAsCorruptedWhenAlreadyClosed(t *testing.
 	stream.conn = receiveErrConn{err: io.ErrUnexpectedEOF}
 	stream.closed.Store(true)
 
-	corrupted := stream.sinkLoop(
+	stop, retryable := stream.sinkLoop(
 		context.Background(),
 		&messageBuffer{outCh: make(chan *Message, 1)},
 		&streamTxBuffer{},
 	)
-	if corrupted {
-		t.Fatal("expected an already-closed stream to stop without being treated as corrupted")
+	if stop != nil || retryable {
+		t.Fatalf("expected an already-closed stream to stop without a fatal error, got stop=%v retryable=%v", stop, retryable)
+	}
+}
+
+func TestSinkStopsOnUndecodableMessageWithoutReconnect(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+
+	payload := make([]byte, 25)
+	binary.BigEndian.PutUint64(payload[0:], uint64(0x16B6D80))
+	binary.BigEndian.PutUint64(payload[8:], uint64(0x16B6D90))
+	payload[24] = 'Z'
+	conn := &oneMessageConn{msg: &pgproto3.CopyData{Data: append([]byte{message.XLogDataByteID}, payload...)}}
+
+	stream := NewStream("", config.Config{
+		Reconnect: config.ReconnectConfig{Enabled: true, InitialDelay: time.Millisecond, MaxDelay: time.Millisecond, MaxElapsed: time.Minute},
+	}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
+	stream.conn = conn
+
+	stream.sink(context.Background())
+
+	select {
+	case err := <-stream.Err():
+		if !errors.Is(err, ErrUndecodableMessage) {
+			t.Fatalf("unexpected fatal error: %v", err)
+		}
+	default:
+		t.Fatal("expected a fatal error on Err() after an undecodable message")
+	}
+	if conn.connects.Load() != 0 {
+		t.Fatal("an undecodable message opened a new connection")
+	}
+	if stream.LoadXLogPos() != 0 {
+		t.Fatalf("received position moved to %s", stream.LoadXLogPos())
+	}
+	if stream.LoadConfirmedXLogPos() != 0 {
+		t.Fatalf("confirmed position moved to %s", stream.LoadConfirmedXLogPos())
+	}
+	if !stream.closed.Load() {
+		t.Fatal("expected the stream to close before reporting the fatal error")
 	}
 }
 
@@ -318,6 +359,33 @@ func (c receiveErrConn) ReceiveMessage(context.Context) (pgproto3.BackendMessage
 func (receiveErrConn) Frontend() *pgproto3.Frontend { return nil }
 
 func (receiveErrConn) Exec(context.Context, string) *pgconn.MultiResultReader { return nil }
+
+type oneMessageConn struct {
+	msg      pgproto3.BackendMessage
+	connects atomic.Int32
+}
+
+func (c *oneMessageConn) Connect(context.Context) error {
+	c.connects.Add(1)
+	return errors.New("reconnect must not run for an undecodable message")
+}
+
+func (c *oneMessageConn) IsClosed() bool { return false }
+
+func (c *oneMessageConn) Close(context.Context) error { return nil }
+
+func (c *oneMessageConn) ReceiveMessage(context.Context) (pgproto3.BackendMessage, error) {
+	if c.msg == nil {
+		return nil, io.EOF
+	}
+	msg := c.msg
+	c.msg = nil
+	return msg, nil
+}
+
+func (c *oneMessageConn) Frontend() *pgproto3.Frontend { return nil }
+
+func (c *oneMessageConn) Exec(context.Context, string) *pgconn.MultiResultReader { return nil }
 
 type eofConn struct{}
 
