@@ -46,3 +46,29 @@ func TestHandleXLogDataDoesNotAdvancePastUndecodableMessage(t *testing.T) {
 		}
 	})
 }
+
+func TestHandleXLogDataSkipsMessagesThatHaveNoRow(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	confirmed := pq.LSN(10)
+	stream.UpdateConfirmedXLogPos(confirmed)
+	walEnd := pq.LSN(0x16B6D90)
+	out := make(chan *Message, 1)
+
+	for _, b := range []byte{'Y', 'O', 'M'} {
+		data := make([]byte, 25)
+		binary.BigEndian.PutUint64(data[0:], uint64(0x16B6D80))
+		binary.BigEndian.PutUint64(data[8:], uint64(walEnd))
+		data[24] = b
+
+		err := stream.handleXLogData(data, &messageBuffer{outCh: out}, &streamTxBuffer{})
+		require.NoError(t, err)
+		assert.Equal(t, walEnd, stream.LoadXLogPos())
+		assert.Equal(t, confirmed, stream.LoadConfirmedXLogPos())
+		select {
+		case msg := <-out:
+			t.Fatalf("published a message that has no row: %v", msg.message)
+		default:
+		}
+	}
+}

@@ -826,14 +826,20 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	)
 
 	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation, s.config.SkipTupleMapDecode)
+	if goerrors.Is(err, message.ErrMessageNotDecoded) {
+		// Type, origin, and logical messages have no row. Skip them and keep
+		// reading. Stopping here would restart on the same message forever.
+		logger.Debug("wal data message skipped", "error", err, "walStart", xld.WALStart.String())
+		s.noteReceivedWAL(xld)
+		return nil
+	}
 	if err != nil || decodedMsg == nil {
 		err = undecodableMessage(xld.WALStart, err)
 		logger.Error("wal data message parsing error", "error", err, "walStart", xld.WALStart.String())
 		return err
 	}
 
-	s.UpdateXLogPos(xld.ServerWALEnd)
-	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
+	s.noteReceivedWAL(xld)
 
 	// add LSN to insert/update/delete messages
 	switch m := decodedMsg.(type) {
@@ -855,6 +861,12 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
 	return nil
+}
+
+// noteReceivedWAL records that this record was read. It does not confirm it.
+func (s *stream) noteReceivedWAL(xld XLogData) {
+	s.UpdateXLogPos(xld.ServerWALEnd)
+	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
 }
 
 // undecodableMessage marks err as a WAL record this process cannot decode.

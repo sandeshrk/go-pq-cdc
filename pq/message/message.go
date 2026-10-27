@@ -1,6 +1,8 @@
 package message
 
 import (
+	goerrors "errors"
+	"fmt"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
@@ -30,6 +32,12 @@ const (
 )
 
 var ErrorByteNotSupported = errors.New("message byte not supported")
+
+// ErrMessageNotDecoded is a replication message this driver recognizes and
+// does not decode: a type definition, a replication origin, or a logical
+// message. It is not a row, and it is not a corrupt record. The stream
+// skips it. A stdlib error so errors.Is can see it through fmt.Errorf.
+var ErrMessageNotDecoded = goerrors.New("replication message is not decoded")
 
 type Type uint8
 
@@ -72,6 +80,8 @@ func New(data []byte, streamedTransaction bool, serverTime time.Time, relation m
 			relation[msg.OID] = msg
 		}
 		return msg, err
+	case TypeByte, OriginByte, LogicalByte:
+		return nil, fmt.Errorf("%w: %q", ErrMessageNotDecoded, data[0])
 	default:
 		return nil, errors.Wrap(ErrorByteNotSupported, string(data[0]))
 	}

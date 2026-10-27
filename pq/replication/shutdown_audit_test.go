@@ -16,6 +16,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -250,6 +251,40 @@ func TestSinkStopsOnUndecodableMessageWithoutReconnect(t *testing.T) {
 	}
 	if !stream.closed.Load() {
 		t.Fatal("expected the stream to close before reporting the fatal error")
+	}
+}
+
+func TestSinkLoopContinuesAfterAMessageWithNoRow(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+
+	walEnd := pq.LSN(0x16B6D90)
+	payload := make([]byte, 25)
+	binary.BigEndian.PutUint64(payload[0:], uint64(0x16B6D80))
+	binary.BigEndian.PutUint64(payload[8:], uint64(walEnd))
+	payload[24] = 'Y'
+	conn := &oneMessageConn{msg: &pgproto3.CopyData{Data: append([]byte{message.XLogDataByteID}, payload...)}}
+
+	stream := NewStream("", config.Config{}, metric.NewMetric("test"), func(*ListenerContext) {}).(*stream)
+	confirmed := pq.LSN(10)
+	stream.UpdateConfirmedXLogPos(confirmed)
+	stream.conn = conn
+
+	retryable, stop := stream.sinkLoop(
+		context.Background(),
+		&messageBuffer{outCh: make(chan *Message, 1)},
+		&streamTxBuffer{},
+	)
+	if !errors.Is(stop, ErrStreamCorrupted) || !retryable {
+		t.Fatalf("expected the read after the skipped message to end the connection, got stop=%v retryable=%v", stop, retryable)
+	}
+	if errors.Is(stop, ErrUndecodableMessage) {
+		t.Fatal("a type message stopped the stream")
+	}
+	if stream.LoadXLogPos() != walEnd {
+		t.Fatalf("received position is %s, want %s", stream.LoadXLogPos(), walEnd)
+	}
+	if stream.LoadConfirmedXLogPos() != confirmed {
+		t.Fatalf("confirmed position changed from %s to %s", confirmed, stream.LoadConfirmedXLogPos())
 	}
 }
 
