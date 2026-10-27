@@ -11,10 +11,6 @@ import (
 
 // SuperviseOpts configures Supervise's retry backoff.
 type SuperviseOpts struct {
-	// InitialBackoff is the delay before the first retry. Defaults to 250ms.
-	InitialBackoff time.Duration
-	// MaxBackoff caps the exponential backoff between retries. Defaults to 30s.
-	MaxBackoff time.Duration
 	// OnRetry, if set, is called before each backoff wait, in addition to the
 	// package's own logging.
 	OnRetry func(attempt int, err error, backoff time.Duration)
@@ -27,6 +23,10 @@ type SuperviseOpts struct {
 	// panic inside it is recovered and logged, not propagated, but it should
 	// still not block indefinitely.
 	OnReady func()
+	// InitialBackoff is the delay before the first retry. Defaults to 250ms.
+	InitialBackoff time.Duration
+	// MaxBackoff caps the exponential backoff between retries. Defaults to 30s.
+	MaxBackoff time.Duration
 }
 
 func (o SuperviseOpts) withDefaults() SuperviseOpts {

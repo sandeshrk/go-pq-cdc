@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"slices"
 	"strconv"
@@ -19,17 +20,21 @@ import (
 const defaultSchema = "public"
 
 type Config struct {
-	Logger      LoggerConfig       `json:"logger" yaml:"logger"`
-	Host        string             `json:"host" yaml:"host"`
-	Username    string             `json:"username" yaml:"username"`
-	Password    string             `json:"password" yaml:"password"`
-	Database    string             `json:"database" yaml:"database"`
-	Publication publication.Config `json:"publication" yaml:"publication"`
-	Heartbeat   HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
-	Slot        slot.Config        `json:"slot" yaml:"slot"`
-	Snapshot    SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
-	Port        int                `json:"port" yaml:"port"`
-	Metric      MetricConfig       `json:"metric" yaml:"metric"`
+	Logger          LoggerConfig          `json:"logger" yaml:"logger"`
+	Host            string                `json:"host" yaml:"host"`
+	Username        string                `json:"username" yaml:"username"`
+	Password        string                `json:"password" yaml:"password"`
+	Database        string                `json:"database" yaml:"database"`
+	Heartbeat       HeartbeatConfig       `json:"heartbeat" yaml:"heartbeat"`
+	Publication     publication.Config    `json:"publication" yaml:"publication"`
+	Slot            slot.Config           `json:"slot" yaml:"slot"`
+	VisibilityGuard VisibilityGuardConfig `json:"visibilityGuard" yaml:"visibilityGuard"`
+	Snapshot        SnapshotConfig        `json:"snapshot" yaml:"snapshot"`
+	// Reconnect governs in-process reconnection of the replication stream
+	// after an unrecoverable connection loss. See ReconnectConfig.
+	Reconnect ReconnectConfig `json:"reconnect" yaml:"reconnect"`
+	Port      int             `json:"port" yaml:"port"`
+	Metric    MetricConfig    `json:"metric" yaml:"metric"`
 	// ConnectTimeout bounds establishing a connection. Without it a blackholed
 	// host is bounded only by the OS TCP timeout. Defaults to 10s.
 	ConnectTimeout time.Duration `json:"connectTimeout" yaml:"connectTimeout"`
@@ -37,9 +42,7 @@ type Config struct {
 	// (non-replication) connections. Disabled by default; setting it makes the
 	// publication DDL fail fast instead of queueing behind a conflicting lock,
 	// which in PostgreSQL's FIFO lock queue also blocks every reader behind it.
-	LockTimeout      time.Duration    `json:"lockTimeout" yaml:"lockTimeout"`
-	DebugMode        bool             `json:"debugMode" yaml:"debugMode"`
-	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
+	LockTimeout time.Duration `json:"lockTimeout" yaml:"lockTimeout"`
 	// LSNFlushInterval periodically sends a standby status update on the
 	// replication connection, independent of the sink's read-idle timeout and
 	// PostgreSQL's own keepalive replies. Without it, confirmed_flush_lsn only
@@ -48,16 +51,69 @@ type Config struct {
 	// neither may happen, so WAL is retained indefinitely. Defaults to 5s. Set
 	// to a negative value to disable; 0 falls back to the default, matching
 	// this package's other Duration options.
-	LSNFlushInterval time.Duration `json:"lsnFlushInterval" yaml:"lsnFlushInterval"`
+	LSNFlushInterval time.Duration    `json:"lsnFlushInterval" yaml:"lsnFlushInterval"`
+	DebugMode        bool             `json:"debugMode" yaml:"debugMode"`
+	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
 	// SkipTupleMapDecode skips building the Decoded/NewDecoded/OldDecoded map
 	// on Insert/Update/Delete messages (see format package). Off by default
 	// to preserve existing behavior; a consumer that resolves columns
 	// directly from TupleData/NewTupleData/OldTupleData can enable it to
 	// avoid the extra allocation and decode pass this map costs per row.
 	SkipTupleMapDecode bool `json:"skipTupleMapDecode" yaml:"skipTupleMapDecode"`
-	// Reconnect governs in-process reconnection of the replication stream
-	// after an unrecoverable connection loss. See ReconnectConfig.
-	Reconnect ReconnectConfig `json:"reconnect" yaml:"reconnect"`
+}
+
+// VisibilityGuardConfig holds the first message of every transaction until the
+// transaction is visible to new snapshots on the primary. See
+// docs/visibility-gate-design.md.
+type VisibilityGuardConfig struct {
+	// Replicas lists standbys (host:port) that must have replayed the
+	// transaction's commit record before its first message is dispatched.
+	// Credentials and database come from the main config. Direct hosts only,
+	// never a pooled endpoint. See docs/replica-guard-design.md.
+	FailMode     VisibilityFailMode `json:"failMode" yaml:"failMode"`
+	Replicas     []string           `json:"replicas" yaml:"replicas"`
+	Timeout      time.Duration      `json:"timeout" yaml:"timeout"`
+	PollInterval time.Duration      `json:"pollInterval" yaml:"pollInterval"`
+	Enabled      bool               `json:"enabled" yaml:"enabled"`
+}
+
+type VisibilityFailMode string
+
+const (
+	// VisibilityFailClosed restarts the stream on a timeout or guard error; the message is redelivered.
+	VisibilityFailClosed VisibilityFailMode = "closed"
+	// VisibilityFailOpen logs a warning and dispatches anyway on a timeout; guard errors still restart the stream.
+	VisibilityFailOpen VisibilityFailMode = "open"
+)
+
+func (v *VisibilityGuardConfig) Validate() error {
+	if !v.Enabled {
+		if len(v.Replicas) > 0 {
+			return errors.New("visibilityGuard.replicas requires visibilityGuard.enabled: true")
+		}
+		return nil
+	}
+	var err error
+	seen := make(map[string]bool, len(v.Replicas))
+	for _, r := range v.Replicas {
+		if _, _, e := net.SplitHostPort(r); e != nil {
+			err = errors.Join(err, fmt.Errorf("visibilityGuard.replicas: %q must be host:port", r))
+		}
+		if seen[r] {
+			err = errors.Join(err, fmt.Errorf("visibilityGuard.replicas: %q listed twice", r))
+		}
+		seen[r] = true
+	}
+	if v.FailMode != VisibilityFailClosed && v.FailMode != VisibilityFailOpen {
+		err = errors.Join(err, errors.New("visibilityGuard.failMode must be 'closed' or 'open'"))
+	}
+	if v.Timeout <= 0 {
+		err = errors.Join(err, errors.New("visibilityGuard.timeout must be greater than 0"))
+	}
+	if v.PollInterval <= 0 {
+		err = errors.Join(err, errors.New("visibilityGuard.pollInterval must be greater than 0"))
+	}
+	return err
 }
 
 type MetricConfig struct {
@@ -144,6 +200,11 @@ func (c *Config) ReplicationDSN() string {
 	return c.dsn(params)
 }
 
+// ReplicaDSN is DSN() pointed at one visibilityGuard.replicas entry (host:port).
+func (c *Config) ReplicaDSN(hostPort string) string {
+	return fmt.Sprintf("postgres://%s:%s@%s/%s", url.QueryEscape(c.Username), url.QueryEscape(c.Password), hostPort, c.Database)
+}
+
 func (c *Config) DSNWithoutSSL() string {
 	params := url.Values{"sslmode": []string{"disable"}}
 	return c.dsn(params)
@@ -162,38 +223,50 @@ func (c *Config) dsn(params url.Values) string {
 	return dsn + "?" + params.Encode()
 }
 
-func (c *Config) SetDefault() {
+func (c *Config) setConnectionDefaults() {
 	if c.Port == 0 {
 		c.Port = 5432
 	}
-
 	if c.ConnectTimeout == 0 {
 		c.ConnectTimeout = 10 * time.Second
 	}
-
 	if c.LSNFlushInterval == 0 {
 		c.LSNFlushInterval = 5 * time.Second
 	}
-
 	if c.Reconnect.InitialDelay == 0 {
 		c.Reconnect.InitialDelay = 250 * time.Millisecond
 	}
-
 	if c.Reconnect.MaxDelay == 0 {
 		c.Reconnect.MaxDelay = 30 * time.Second
 	}
-
 	if c.Reconnect.MaxJitter == 0 {
 		c.Reconnect.MaxJitter = time.Second
 	}
-
 	if c.Reconnect.MaxElapsed == 0 {
 		c.Reconnect.MaxElapsed = 5 * time.Minute
 	}
-
 	if c.Metric.Port == 0 {
 		c.Metric.Port = 8080
 	}
+}
+
+func (c *Config) setVisibilityGuardDefaults() {
+	if !c.VisibilityGuard.Enabled {
+		return
+	}
+	if c.VisibilityGuard.FailMode == "" {
+		c.VisibilityGuard.FailMode = VisibilityFailClosed
+	}
+	if c.VisibilityGuard.Timeout == 0 {
+		c.VisibilityGuard.Timeout = 10 * time.Second
+	}
+	if c.VisibilityGuard.PollInterval == 0 {
+		c.VisibilityGuard.PollInterval = 5 * time.Millisecond
+	}
+}
+
+func (c *Config) SetDefault() {
+	c.setConnectionDefaults()
 
 	// Default heartbeat interval when table is configured
 	if c.Heartbeat.Table.Name != "" {
@@ -205,16 +278,18 @@ func (c *Config) SetDefault() {
 		}
 	}
 
+	if c.Logger.Logger == nil {
+		c.Logger.Logger = logger.NewSlog(c.Logger.LogLevel)
+	}
+
+	c.setVisibilityGuardDefaults()
+
 	if c.Slot.SlotActivityCheckerInterval == 0 {
 		c.Slot.SlotActivityCheckerInterval = 1000
 	}
 
 	if c.Slot.ProtoVersion == 0 {
 		c.Slot.ProtoVersion = 1
-	}
-
-	if c.Logger.Logger == nil {
-		c.Logger.Logger = logger.NewSlog(c.Logger.LogLevel)
 	}
 
 	// Set default schema names for tables
@@ -372,6 +447,10 @@ func (c *Config) Validate() error {
 		}
 
 		if cErr := c.Slot.Validate(); cErr != nil {
+			err = errors.Join(err, cErr)
+		}
+
+		if cErr := c.VisibilityGuard.Validate(); cErr != nil {
 			err = errors.Join(err, cErr)
 		}
 	}

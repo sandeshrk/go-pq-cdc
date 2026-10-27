@@ -15,6 +15,8 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
 )
 
+const publicSchema = "public"
+
 // This example demonstrates CTID block partitioning and explicit partition strategy configuration.
 //
 // CTID partitioning is automatically used when:
@@ -54,20 +56,20 @@ func main() {
 				{
 					Name:            "products",
 					ReplicaIdentity: publication.ReplicaIdentityFull,
-					Schema:          "public",
+					Schema:          publicSchema,
 				},
 				// Table with STRING PK - CTID will be auto-detected
 				{
 					Name:            "orders",
 					ReplicaIdentity: publication.ReplicaIdentityFull,
-					Schema:          "public",
+					Schema:          publicSchema,
 				},
 				// Table with INTEGER PK but using CTID explicitly
 				// Useful when integer PK is hash-based (not sequential)
 				{
 					Name:                      "events",
 					ReplicaIdentity:           publication.ReplicaIdentityFull,
-					Schema:                    "public",
+					Schema:                    publicSchema,
 					SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
 				},
 			},
