@@ -829,7 +829,7 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	if goerrors.Is(err, message.ErrMessageNotDecoded) {
 		// Type, origin, and logical messages have no row. Skip them and keep
 		// reading. Stopping here would restart on the same message forever.
-		logger.Debug("wal data message skipped", "error", err, "walStart", xld.WALStart.String())
+		logger.Debug("skipping type, origin, or logical message; it has no row to deliver", "error", err, "walStart", xld.WALStart.String())
 		s.noteReceivedWAL(xld)
 		return nil
 	}
