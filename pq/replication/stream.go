@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -499,6 +500,36 @@ func (s *stream) sink(ctx context.Context) {
 	}
 }
 
+// activeReplicationSlotError marks a slot-acquisition failure caused by a
+// replication slot that still has an active backend. Reconnect retries it.
+// A SQLSTATE 55006 from Connect is not wrapped, so it stays permanent.
+type activeReplicationSlotError struct{ error }
+
+func (e *activeReplicationSlotError) Unwrap() error { return e.error }
+
+// reconnectableError reports whether a failed reconnect attempt can succeed
+// on a later try. Connection errors use pq.IsRetryableConnectionError.
+// An active replication slot is separate so SQLSTATE 55006 is not retryable
+// as a class, and so the same code from Connect stops immediately.
+func reconnectableError(err error) bool {
+	var active *activeReplicationSlotError
+	if goerrors.As(err, &active) {
+		return true
+	}
+	return pq.IsRetryableConnectionError(err)
+}
+
+// replicationSlotIsActive reports PostgreSQL's error for a replication slot
+// whose previous backend has not released it. The message is
+// `replication slot "<name>" is active for PID <pid>`.
+func replicationSlotIsActive(err error) bool {
+	var pgErr *pgconn.PgError
+	if !goerrors.As(err, &pgErr) || pgErr.Code != "55006" {
+		return false
+	}
+	return strings.Contains(pgErr.Message, "replication slot") && strings.Contains(pgErr.Message, "is active for PID")
+}
+
 // reconnect attempts to reopen the replication connection after sinkLoop
 // reports a corrupted connection, following s.config.Reconnect's backoff and
 // budget (wall-clock MaxElapsed, additionally bounded by MaxAttempts if set).
@@ -539,8 +570,14 @@ func (s *stream) reconnect(ctx context.Context) bool {
 		// with cdc.IsRetryableStartupError) and stops retrying immediately
 		// instead of burning the whole MaxElapsed budget on an attempt that
 		// cannot succeed.
+		//
+		// A replication slot that is still active is the exception. PostgreSQL
+		// reports SQLSTATE 55006 and "replication slot ... is active for PID
+		// ..." while the previous backend still owns the slot. That condition
+		// clears on its own, so it uses this same budget. Other SQLSTATE 55006
+		// errors are not retried.
 		retry.RetryIf(func(err error) bool {
-			return time.Since(start) < cfg.MaxElapsed && pq.IsRetryableConnectionError(errors.Cause(err))
+			return time.Since(start) < cfg.MaxElapsed && reconnectableError(errors.Cause(err))
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			logger.Warn("replication stream reconnect attempt failed",
@@ -571,11 +608,19 @@ func (s *stream) reconnect(ctx context.Context) bool {
 			return err
 		}
 
-		return s.setup(ctx)
+		if err := s.setup(ctx); err != nil {
+			// Only slot acquisition is retried for an active replication slot.
+			// The same SQLSTATE from Connect stays permanent.
+			if replicationSlotIsActive(err) {
+				return &activeReplicationSlotError{error: err}
+			}
+			return err
+		}
+		return nil
 	}, options...)
 
 	if err != nil {
-		if !pq.IsRetryableConnectionError(errors.Cause(err)) {
+		if !reconnectableError(errors.Cause(err)) {
 			logger.Error("giving up on in-process reconnect: permanent error, not retrying", "elapsed", time.Since(start).String(), "error", err)
 		} else {
 			logger.Error("giving up on in-process reconnect", "elapsed", time.Since(start).String(), "error", err)
