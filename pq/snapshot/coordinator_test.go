@@ -8,9 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-//go:fix inline
-func ptrInt64(v int64) *int64 { return new(v) }
-
 func TestAndCondition(t *testing.T) {
 	t.Run("both empty returns empty", func(t *testing.T) {
 		assert.Empty(t, andCondition("", ""))
@@ -99,8 +96,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
-			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(1000),
+			RangeStart:        new(int64(1)),
+			RangeEnd:          new(int64(1000)),
 			ChunkSize:         500,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "is_active = true")
@@ -113,8 +110,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
-			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(10),
+			RangeStart:        new(int64(1)),
+			RangeEnd:          new(int64(10)),
 			ChunkSize:         5,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "")
@@ -139,8 +136,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
-			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(1000),
+			RangeStart:        new(int64(1)),
+			RangeEnd:          new(int64(1000)),
 			ChunkSize:         500,
 		}
 		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "status = 'a' OR status = 'b'")
@@ -164,8 +161,8 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
-			BlockStart:        ptrInt64(0),
-			BlockEnd:          ptrInt64(100),
+			BlockStart:        new(int64(0)),
+			BlockEnd:          new(int64(100)),
 		}
 		q := s.buildChunkQuery(chunk, "", nil, "tenant_id = 7")
 		assert.Contains(t, q, "WHERE ctid >= '(0,0)'::tid AND ctid < '(100,0)'::tid AND (tenant_id = 7)")
@@ -176,7 +173,7 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
-			BlockStart:        ptrInt64(50),
+			BlockStart:        new(int64(50)),
 			BlockEnd:          nil,
 			IsLastChunk:       true,
 		}

@@ -39,11 +39,11 @@ var errDialRefused = fakeDialError{msg: "dial refused"}
 // replication.Test() (called from setup()) needs, since Connect succeeding
 // is the only thing under test here.
 type reconnectFakeConn struct {
-	mu               sync.Mutex
+	fe               *pgproto3.Frontend
 	connectCalls     int
 	failConnectUntil int
+	mu               sync.Mutex
 	closed           bool
-	fe               *pgproto3.Frontend
 }
 
 func newReconnectFakeConn(failConnectUntil int) *reconnectFakeConn {
@@ -309,10 +309,10 @@ func TestSinkReportsFatalErrorAfterReconnectBudgetExhausted(t *testing.T) {
 // (as Close() would cause) rather than another failure - proving sink()
 // itself, not just reconnect() in isolation, resumes normally with no panic.
 type recoversOnSecondConnectConn struct {
-	mu           sync.Mutex
+	closedFlag   *atomic.Bool
 	connectCalls int
 	recvCalls    int
-	closedFlag   *atomic.Bool
+	mu           sync.Mutex
 }
 
 func (c *recoversOnSecondConnectConn) Connect(context.Context) error {
@@ -538,16 +538,16 @@ func TestSinkReportsFatalErrorImmediatelyWhenReconnectDisabled(t *testing.T) {
 // slotStatusConn is a connection whose replication handshake returns a
 // PostgreSQL ErrorResponse for the first failReceives reads.
 type slotStatusConn struct {
-	mu           sync.Mutex
+	connectErr   error
+	fe           *pgproto3.Frontend
+	onReceive    func()
+	code         string
+	message      string
 	connects     int
 	receives     int
 	failReceives int
-	code         string
-	message      string
-	connectErr   error
+	mu           sync.Mutex
 	closed       bool
-	fe           *pgproto3.Frontend
-	onReceive    func()
 }
 
 func newSlotStatusConn(failReceives int, code, message string) *slotStatusConn {
@@ -635,8 +635,8 @@ func TestReconnectRetriesAnActiveReplicationSlotThenSucceeds(t *testing.T) {
 }
 
 type recordLogger struct {
-	mu   sync.Mutex
 	msgs []string
+	mu   sync.Mutex
 }
 
 func (l *recordLogger) Debug(string, ...any) {}

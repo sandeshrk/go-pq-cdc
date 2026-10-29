@@ -24,12 +24,15 @@ type Config struct {
 	Username    string             `json:"username" yaml:"username"`
 	Password    string             `json:"password" yaml:"password"`
 	Database    string             `json:"database" yaml:"database"`
-	Publication publication.Config `json:"publication" yaml:"publication"`
 	Heartbeat   HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
+	Publication publication.Config `json:"publication" yaml:"publication"`
 	Slot        slot.Config        `json:"slot" yaml:"slot"`
 	Snapshot    SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
-	Port        int                `json:"port" yaml:"port"`
-	Metric      MetricConfig       `json:"metric" yaml:"metric"`
+	// Reconnect governs in-process reconnection of the replication stream
+	// after an unrecoverable connection loss. See ReconnectConfig.
+	Reconnect ReconnectConfig `json:"reconnect" yaml:"reconnect"`
+	Port      int             `json:"port" yaml:"port"`
+	Metric    MetricConfig    `json:"metric" yaml:"metric"`
 	// ConnectTimeout bounds establishing a connection. Without it a blackholed
 	// host is bounded only by the OS TCP timeout. Defaults to 10s.
 	ConnectTimeout time.Duration `json:"connectTimeout" yaml:"connectTimeout"`
@@ -37,9 +40,7 @@ type Config struct {
 	// (non-replication) connections. Disabled by default; setting it makes the
 	// publication DDL fail fast instead of queueing behind a conflicting lock,
 	// which in PostgreSQL's FIFO lock queue also blocks every reader behind it.
-	LockTimeout      time.Duration    `json:"lockTimeout" yaml:"lockTimeout"`
-	DebugMode        bool             `json:"debugMode" yaml:"debugMode"`
-	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
+	LockTimeout time.Duration `json:"lockTimeout" yaml:"lockTimeout"`
 	// LSNFlushInterval periodically sends a standby status update on the
 	// replication connection, independent of the sink's read-idle timeout and
 	// PostgreSQL's own keepalive replies. Without it, confirmed_flush_lsn only
@@ -48,16 +49,15 @@ type Config struct {
 	// neither may happen, so WAL is retained indefinitely. Defaults to 5s. Set
 	// to a negative value to disable; 0 falls back to the default, matching
 	// this package's other Duration options.
-	LSNFlushInterval time.Duration `json:"lsnFlushInterval" yaml:"lsnFlushInterval"`
+	LSNFlushInterval time.Duration    `json:"lsnFlushInterval" yaml:"lsnFlushInterval"`
+	DebugMode        bool             `json:"debugMode" yaml:"debugMode"`
+	ExtensionSupport ExtensionSupport `json:"extensionSupport" yaml:"extensionSupport"`
 	// SkipTupleMapDecode skips building the Decoded/NewDecoded/OldDecoded map
 	// on Insert/Update/Delete messages (see format package). Off by default
 	// to preserve existing behavior; a consumer that resolves columns
 	// directly from TupleData/NewTupleData/OldTupleData can enable it to
 	// avoid the extra allocation and decode pass this map costs per row.
 	SkipTupleMapDecode bool `json:"skipTupleMapDecode" yaml:"skipTupleMapDecode"`
-	// Reconnect governs in-process reconnection of the replication stream
-	// after an unrecoverable connection loss. See ReconnectConfig.
-	Reconnect ReconnectConfig `json:"reconnect" yaml:"reconnect"`
 }
 
 type MetricConfig struct {
@@ -224,26 +224,29 @@ func (c *Config) SetDefault() {
 		}
 	}
 
-	// Set default snapshot config
-	if c.Snapshot.Enabled {
-		if c.Snapshot.Mode == "" {
-			c.Snapshot.Mode = SnapshotModeNever
-		}
-		if c.Snapshot.ChunkSize == 0 {
-			c.Snapshot.ChunkSize = 8_000
-		}
-		if c.Snapshot.ClaimTimeout == 0 {
-			c.Snapshot.ClaimTimeout = 30 * time.Second
-		}
-		if c.Snapshot.HeartbeatInterval == 0 {
-			c.Snapshot.HeartbeatInterval = 5 * time.Second
-		}
+	c.setSnapshotDefaults()
+}
 
-		// Set default schema names for snapshot tables
-		for tableID, table := range c.Snapshot.Tables {
-			if table.Schema == "" {
-				c.Snapshot.Tables[tableID].Schema = defaultSchema
-			}
+func (c *Config) setSnapshotDefaults() {
+	if !c.Snapshot.Enabled {
+		return
+	}
+	if c.Snapshot.Mode == "" {
+		c.Snapshot.Mode = SnapshotModeNever
+	}
+	if c.Snapshot.ChunkSize == 0 {
+		c.Snapshot.ChunkSize = 8_000
+	}
+	if c.Snapshot.ClaimTimeout == 0 {
+		c.Snapshot.ClaimTimeout = 30 * time.Second
+	}
+	if c.Snapshot.HeartbeatInterval == 0 {
+		c.Snapshot.HeartbeatInterval = 5 * time.Second
+	}
+
+	for tableID, table := range c.Snapshot.Tables {
+		if table.Schema == "" {
+			c.Snapshot.Tables[tableID].Schema = defaultSchema
 		}
 	}
 }

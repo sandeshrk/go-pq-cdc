@@ -51,6 +51,12 @@ const (
 type ListenerContext struct {
 	Context context.Context
 	Message any
+	Ack     func() error
+	// AckLSN confirms an arbitrary LSN instead of only WALStart, letting a
+	// transactional sink confirm a position it computed itself (e.g. after
+	// writing a whole transaction to its own store). A non-monotonic value
+	// (<= the already-confirmed position) is a silent no-op.
+	AckLSN func(lsn pq.LSN) error
 	// WALStart is this message's own WAL position: Ack confirms this value,
 	// rewritten to the transaction-end LSN for the last change in a
 	// transaction. See the Delivery Guarantees section of the README.
@@ -59,12 +65,6 @@ type ListenerContext struct {
 	// COMMIT.CommitLSN) for Insert/Update/Delete messages, 0 for message
 	// types that carry no commit context (e.g. Relation, Truncate).
 	CommitLSN pq.LSN
-	Ack       func() error
-	// AckLSN confirms an arbitrary LSN instead of only WALStart, letting a
-	// transactional sink confirm a position it computed itself (e.g. after
-	// writing a whole transaction to its own store). A non-monotonic value
-	// (<= the already-confirmed position) is a silent no-op.
-	AckLSN func(lsn pq.LSN) error
 }
 
 type ListenerFunc func(ctx *ListenerContext)
@@ -90,20 +90,27 @@ type Streamer interface {
 }
 
 type stream struct {
-	metric           metric.Metric
-	conn             pq.Connection
-	cancel           context.CancelFunc
-	system           *pq.IdentifySystemResult
-	relation         map[uint32]*format.Relation
-	messageCH        chan *Message
-	listenerFunc     ListenerFunc
-	sinkEnd          chan struct{}
-	processEnd       chan struct{}
-	flushTickerEnd   chan struct{}
-	fatalCh          chan error
-	mu               *sync.RWMutex
+	metric         metric.Metric
+	conn           pq.Connection
+	listenerFunc   ListenerFunc
+	system         *pq.IdentifySystemResult
+	relation       map[uint32]*format.Relation
+	messageCH      chan *Message
+	sinkEnd        chan struct{}
+	processEnd     chan struct{}
+	flushTickerEnd chan struct{}
+	fatalCh        chan error
+	mu             *sync.RWMutex
+	cancel         context.CancelFunc
+	// txCommit holds the commit context of the non-streamed transaction
+	// currently being decoded, so each of its change messages can be stamped
+	// with it. Written and read only on the sink (reader) goroutine.
+	txCommit struct {
+		time time.Time
+		lsn  pq.LSN
+		xid  uint32
+	}
 	config           config.Config
-	lastXLogPos      pq.LSN
 	snapshotLSN      pq.LSN
 	confirmedXLogPos pq.LSN
 	// deliveredHighWaterMark is the highest walStart ever handed to
@@ -114,6 +121,7 @@ type stream struct {
 	// Every delivered message with walStart <= replayFloor was already
 	// delivered before the disconnect, i.e. it's a replay, not new data.
 	replayFloor         pq.LSN
+	lastXLogPos         pq.LSN
 	messageCloseOnce    sync.Once
 	connMu              sync.Mutex
 	closed              atomic.Bool
@@ -121,14 +129,6 @@ type stream struct {
 	processStarted      atomic.Bool
 	flushTickerStarted  atomic.Bool
 	openFromSnapshotLSN bool
-	// txCommit holds the commit context of the non-streamed transaction
-	// currently being decoded, so each of its change messages can be stamped
-	// with it. Written and read only on the sink (reader) goroutine.
-	txCommit struct {
-		time time.Time
-		lsn  pq.LSN
-		xid  uint32
-	}
 }
 
 func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
@@ -908,7 +908,8 @@ func (s *stream) process(ctx context.Context) {
 			// Sending it here per message serializes every ack behind the sink's
 			// connMu-held read, collapsing throughput to a few messages/sec while
 			// a buffered transaction is drained.
-			ackLSNFunc := func(lsn pq.LSN) error {
+			// AckLSN's type returns error. This closure only updates memory, so the error is always nil.
+			ackLSNFunc := func(lsn pq.LSN) error { //nolint:unparam
 				s.UpdateConfirmedXLogPos(lsn)
 				s.updateUnackedLagMetric()
 				return nil
@@ -1129,12 +1130,6 @@ func (s *stream) updateDeliveredHighWaterMark(l pq.LSN) {
 	if s.deliveredHighWaterMark < l {
 		s.deliveredHighWaterMark = l
 	}
-}
-
-func (s *stream) loadDeliveredHighWaterMark() pq.LSN {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.deliveredHighWaterMark
 }
 
 // markReplayFloor records the current delivered high-water mark as the
