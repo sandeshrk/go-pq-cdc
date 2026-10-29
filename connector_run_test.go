@@ -184,7 +184,7 @@ func TestWaitUntilReadyReturnsErrConnectorClosedBeforeReady(t *testing.T) {
 // channels (closedCh and readyCh respectively), so running them concurrently
 // must never panic, run under -race across many iterations to build
 // confidence beyond a single lucky interleaving.
-func TestCloseDoesNotRaceReadyChClose(t *testing.T) {
+func TestCloseDoesNotRaceReadyChClose(_ *testing.T) {
 	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	for i := 0; i < 100; i++ {

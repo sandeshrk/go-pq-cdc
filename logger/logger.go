@@ -23,6 +23,13 @@ func InitLogger(l Logger) {
 	})
 }
 
+// SwapLogger replaces the process logger and returns the previous one.
+func SwapLogger(l Logger) Logger {
+	prev := _default
+	_default = l
+	return prev
+}
+
 func Debug(msg string, args ...any) {
 	_default.Debug(msg, args...)
 }

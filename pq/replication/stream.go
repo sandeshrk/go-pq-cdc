@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -50,6 +51,12 @@ const (
 type ListenerContext struct {
 	Context context.Context
 	Message any
+	Ack     func() error
+	// AckLSN confirms an arbitrary LSN instead of only WALStart, letting a
+	// transactional sink confirm a position it computed itself (e.g. after
+	// writing a whole transaction to its own store). A non-monotonic value
+	// (<= the already-confirmed position) is a silent no-op.
+	AckLSN func(lsn pq.LSN) error
 	// WALStart is this message's own WAL position: Ack confirms this value,
 	// rewritten to the transaction-end LSN for the last change in a
 	// transaction. See the Delivery Guarantees section of the README.
@@ -58,12 +65,6 @@ type ListenerContext struct {
 	// COMMIT.CommitLSN) for Insert/Update/Delete messages, 0 for message
 	// types that carry no commit context (e.g. Relation, Truncate).
 	CommitLSN pq.LSN
-	Ack       func() error
-	// AckLSN confirms an arbitrary LSN instead of only WALStart, letting a
-	// transactional sink confirm a position it computed itself (e.g. after
-	// writing a whole transaction to its own store). A non-monotonic value
-	// (<= the already-confirmed position) is a silent no-op.
-	AckLSN func(lsn pq.LSN) error
 }
 
 type ListenerFunc func(ctx *ListenerContext)
@@ -89,20 +90,27 @@ type Streamer interface {
 }
 
 type stream struct {
-	metric           metric.Metric
-	conn             pq.Connection
-	cancel           context.CancelFunc
-	system           *pq.IdentifySystemResult
-	relation         map[uint32]*format.Relation
-	messageCH        chan *Message
-	listenerFunc     ListenerFunc
-	sinkEnd          chan struct{}
-	processEnd       chan struct{}
-	flushTickerEnd   chan struct{}
-	fatalCh          chan error
-	mu               *sync.RWMutex
+	metric         metric.Metric
+	conn           pq.Connection
+	listenerFunc   ListenerFunc
+	system         *pq.IdentifySystemResult
+	relation       map[uint32]*format.Relation
+	messageCH      chan *Message
+	sinkEnd        chan struct{}
+	processEnd     chan struct{}
+	flushTickerEnd chan struct{}
+	fatalCh        chan error
+	mu             *sync.RWMutex
+	cancel         context.CancelFunc
+	// txCommit holds the commit context of the non-streamed transaction
+	// currently being decoded, so each of its change messages can be stamped
+	// with it. Written and read only on the sink (reader) goroutine.
+	txCommit struct {
+		time time.Time
+		lsn  pq.LSN
+		xid  uint32
+	}
 	config           config.Config
-	lastXLogPos      pq.LSN
 	snapshotLSN      pq.LSN
 	confirmedXLogPos pq.LSN
 	// deliveredHighWaterMark is the highest walStart ever handed to
@@ -113,6 +121,7 @@ type stream struct {
 	// Every delivered message with walStart <= replayFloor was already
 	// delivered before the disconnect, i.e. it's a replay, not new data.
 	replayFloor         pq.LSN
+	lastXLogPos         pq.LSN
 	messageCloseOnce    sync.Once
 	connMu              sync.Mutex
 	closed              atomic.Bool
@@ -120,14 +129,6 @@ type stream struct {
 	processStarted      atomic.Bool
 	flushTickerStarted  atomic.Bool
 	openFromSnapshotLSN bool
-	// txCommit holds the commit context of the non-streamed transaction
-	// currently being decoded, so each of its change messages can be stamped
-	// with it. Written and read only on the sink (reader) goroutine.
-	txCommit struct {
-		time time.Time
-		lsn  pq.LSN
-		xid  uint32
-	}
 }
 
 func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
@@ -499,6 +500,36 @@ func (s *stream) sink(ctx context.Context) {
 	}
 }
 
+// activeReplicationSlotError marks a slot-acquisition failure caused by a
+// replication slot that still has an active backend. Reconnect retries it.
+// A SQLSTATE 55006 from Connect is not wrapped, so it stays permanent.
+type activeReplicationSlotError struct{ error }
+
+func (e *activeReplicationSlotError) Unwrap() error { return e.error }
+
+// reconnectableError reports whether a failed reconnect attempt can succeed
+// on a later try. Connection errors use pq.IsRetryableConnectionError.
+// An active replication slot is separate so SQLSTATE 55006 is not retryable
+// as a class, and so the same code from Connect stops immediately.
+func reconnectableError(err error) bool {
+	var active *activeReplicationSlotError
+	if goerrors.As(err, &active) {
+		return true
+	}
+	return pq.IsRetryableConnectionError(err)
+}
+
+// replicationSlotIsActive reports PostgreSQL's error for a replication slot
+// whose previous backend has not released it. The message is
+// `replication slot "<name>" is active for PID <pid>`.
+func replicationSlotIsActive(err error) bool {
+	var pgErr *pgconn.PgError
+	if !goerrors.As(err, &pgErr) || pgErr.Code != "55006" {
+		return false
+	}
+	return strings.Contains(pgErr.Message, "replication slot") && strings.Contains(pgErr.Message, "is active for PID")
+}
+
 // reconnect attempts to reopen the replication connection after sinkLoop
 // reports a corrupted connection, following s.config.Reconnect's backoff and
 // budget (wall-clock MaxElapsed, additionally bounded by MaxAttempts if set).
@@ -539,8 +570,14 @@ func (s *stream) reconnect(ctx context.Context) bool {
 		// with cdc.IsRetryableStartupError) and stops retrying immediately
 		// instead of burning the whole MaxElapsed budget on an attempt that
 		// cannot succeed.
+		//
+		// A replication slot that is still active is the exception. PostgreSQL
+		// reports SQLSTATE 55006 and "replication slot ... is active for PID
+		// ..." while the previous backend still owns the slot. That condition
+		// clears on its own, so it uses this same budget. Other SQLSTATE 55006
+		// errors are not retried.
 		retry.RetryIf(func(err error) bool {
-			return time.Since(start) < cfg.MaxElapsed && pq.IsRetryableConnectionError(errors.Cause(err))
+			return time.Since(start) < cfg.MaxElapsed && reconnectableError(errors.Cause(err))
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			logger.Warn("replication stream reconnect attempt failed",
@@ -571,11 +608,19 @@ func (s *stream) reconnect(ctx context.Context) bool {
 			return err
 		}
 
-		return s.setup(ctx)
+		if err := s.setup(ctx); err != nil {
+			// Only slot acquisition is retried for an active replication slot.
+			// The same SQLSTATE from Connect stays permanent.
+			if replicationSlotIsActive(err) {
+				return &activeReplicationSlotError{error: err}
+			}
+			return err
+		}
+		return nil
 	}, options...)
 
 	if err != nil {
-		if !pq.IsRetryableConnectionError(errors.Cause(err)) {
+		if !reconnectableError(errors.Cause(err)) {
 			logger.Error("giving up on in-process reconnect: permanent error, not retrying", "elapsed", time.Since(start).String(), "error", err)
 		} else {
 			logger.Error("giving up on in-process reconnect", "elapsed", time.Since(start).String(), "error", err)
@@ -863,7 +908,8 @@ func (s *stream) process(ctx context.Context) {
 			// Sending it here per message serializes every ack behind the sink's
 			// connMu-held read, collapsing throughput to a few messages/sec while
 			// a buffered transaction is drained.
-			ackLSNFunc := func(lsn pq.LSN) error {
+			// AckLSN's type returns error. This closure only updates memory, so the error is always nil.
+			ackLSNFunc := func(lsn pq.LSN) error { //nolint:unparam
 				s.UpdateConfirmedXLogPos(lsn)
 				s.updateUnackedLagMetric()
 				return nil
@@ -1084,12 +1130,6 @@ func (s *stream) updateDeliveredHighWaterMark(l pq.LSN) {
 	if s.deliveredHighWaterMark < l {
 		s.deliveredHighWaterMark = l
 	}
-}
-
-func (s *stream) loadDeliveredHighWaterMark() pq.LSN {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.deliveredHighWaterMark
 }
 
 // markReplayFloor records the current delivered high-water mark as the

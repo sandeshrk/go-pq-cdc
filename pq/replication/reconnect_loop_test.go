@@ -39,11 +39,11 @@ var errDialRefused = fakeDialError{msg: "dial refused"}
 // replication.Test() (called from setup()) needs, since Connect succeeding
 // is the only thing under test here.
 type reconnectFakeConn struct {
-	mu               sync.Mutex
+	fe               *pgproto3.Frontend
 	connectCalls     int
 	failConnectUntil int
+	mu               sync.Mutex
 	closed           bool
-	fe               *pgproto3.Frontend
 }
 
 func newReconnectFakeConn(failConnectUntil int) *reconnectFakeConn {
@@ -309,10 +309,10 @@ func TestSinkReportsFatalErrorAfterReconnectBudgetExhausted(t *testing.T) {
 // (as Close() would cause) rather than another failure - proving sink()
 // itself, not just reconnect() in isolation, resumes normally with no panic.
 type recoversOnSecondConnectConn struct {
-	mu           sync.Mutex
+	closedFlag   *atomic.Bool
 	connectCalls int
 	recvCalls    int
-	closedFlag   *atomic.Bool
+	mu           sync.Mutex
 }
 
 func (c *recoversOnSecondConnectConn) Connect(context.Context) error {
@@ -532,5 +532,244 @@ func TestSinkReportsFatalErrorImmediatelyWhenReconnectDisabled(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected a fatal error on Err() after unexpected disconnect when reconnect is disabled")
+	}
+}
+
+// slotStatusConn is a connection whose replication handshake returns a
+// PostgreSQL ErrorResponse for the first failReceives reads.
+type slotStatusConn struct {
+	connectErr   error
+	fe           *pgproto3.Frontend
+	onReceive    func()
+	code         string
+	message      string
+	connects     int
+	receives     int
+	failReceives int
+	mu           sync.Mutex
+	closed       bool
+}
+
+func newSlotStatusConn(failReceives int, code, message string) *slotStatusConn {
+	return &slotStatusConn{
+		failReceives: failReceives,
+		code:         code,
+		message:      message,
+		fe:           pgproto3.NewFrontend(strings.NewReader(""), io.Discard),
+	}
+}
+
+func (c *slotStatusConn) Connect(context.Context) error {
+	c.mu.Lock()
+	c.connects++
+	err := c.connectErr
+	if err == nil {
+		c.closed = false
+	}
+	c.mu.Unlock()
+	return err
+}
+
+func (c *slotStatusConn) connectCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connects
+}
+
+func (c *slotStatusConn) IsClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+func (c *slotStatusConn) Close(context.Context) error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *slotStatusConn) Frontend() *pgproto3.Frontend { return c.fe }
+
+func (c *slotStatusConn) Exec(context.Context, string) *pgconn.MultiResultReader { return nil }
+
+func (c *slotStatusConn) ReceiveMessage(context.Context) (pgproto3.BackendMessage, error) {
+	if c.onReceive != nil {
+		c.onReceive()
+	}
+	c.mu.Lock()
+	c.receives++
+	n := c.receives
+	code, message, failReceives := c.code, c.message, c.failReceives
+	c.mu.Unlock()
+	if n <= failReceives {
+		return &pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: message}, nil
+	}
+	return &pgproto3.CopyBothResponse{}, nil
+}
+
+func TestReconnectRetriesAnActiveReplicationSlotThenSucceeds(t *testing.T) {
+	s := newTestReconnectStream(config.ReconnectConfig{
+		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond,
+		MaxJitter: time.Millisecond, MaxElapsed: 5 * time.Second,
+	})
+	logs := &recordLogger{}
+	prev := logger.SwapLogger(logs)
+	t.Cleanup(func() {
+		if prev != nil {
+			logger.SwapLogger(prev)
+		}
+	})
+	conn := newSlotStatusConn(1, "55006", `replication slot "cdc_slot_lane_0" is active for PID 66`)
+	s.conn = conn
+
+	if !s.reconnect(context.Background()) {
+		t.Fatal("expected reconnect to succeed once the replication slot is no longer active")
+	}
+	if got := conn.connectCount(); got != 2 {
+		t.Fatalf("expected 2 Connect() calls, got %d", got)
+	}
+	if logs.contains("permanent error") {
+		t.Fatalf("a successful reconnect logged a permanent failure: %q", logs.msgs)
+	}
+}
+
+type recordLogger struct {
+	msgs []string
+	mu   sync.Mutex
+}
+
+func (l *recordLogger) Debug(string, ...any) {}
+func (l *recordLogger) Info(string, ...any)  {}
+func (l *recordLogger) Warn(string, ...any)  {}
+
+func (l *recordLogger) Error(msg string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, msg)
+	for _, arg := range args {
+		if text, ok := arg.(string); ok {
+			l.msgs = append(l.msgs, text)
+		}
+	}
+}
+
+func (l *recordLogger) contains(part string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, msg := range l.msgs {
+		if strings.Contains(msg, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestReconnectGivesUpWhenTheReplicationSlotStaysActive(t *testing.T) {
+	s := newTestReconnectStream(config.ReconnectConfig{
+		Enabled: true, InitialDelay: 2 * time.Millisecond, MaxDelay: 5 * time.Millisecond,
+		MaxJitter: time.Millisecond, MaxElapsed: 30 * time.Millisecond,
+	})
+	conn := newSlotStatusConn(1_000_000, "55006", `replication slot "cdc_slot_lane_0" is active for PID 66`)
+	s.conn = conn
+
+	start := time.Now()
+	ok := s.reconnect(context.Background())
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("expected reconnect to give up while the replication slot stays active")
+	}
+	if got := conn.connectCount(); got < 2 {
+		t.Fatalf("expected more than one Connect() attempt before giving up, got %d", got)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("reconnect took %s to give up on a 30ms budget", elapsed)
+	}
+}
+
+func TestReconnectStopsWhenTheContextEndsDuringAnActiveSlot(t *testing.T) {
+	s := newTestReconnectStream(config.ReconnectConfig{
+		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond,
+		MaxJitter: time.Millisecond, MaxElapsed: time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newSlotStatusConn(1_000_000, "55006", `replication slot "cdc_slot_lane_0" is active for PID 66`)
+	conn.onReceive = cancel
+	s.conn = conn
+
+	start := time.Now()
+	ok := s.reconnect(ctx)
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("expected reconnect to stop when the context ends")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("reconnect took %s after the context ended; MaxElapsed is 1h", elapsed)
+	}
+	if got := conn.connectCount(); got != 1 {
+		t.Fatalf("expected exactly 1 Connect() call after cancellation, got %d", got)
+	}
+}
+
+func TestReconnectDoesNotRetryObjectInUseFromConnect(t *testing.T) {
+	s := newTestReconnectStream(config.ReconnectConfig{
+		Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond,
+		MaxJitter: time.Millisecond, MaxElapsed: time.Hour,
+	})
+	conn := newSlotStatusConn(0, "", "")
+	conn.connectErr = &pgconn.PgError{Code: "55006", Message: `replication slot "cdc_slot_lane_0" is active for PID 66`}
+	s.conn = conn
+
+	start := time.Now()
+	ok := s.reconnect(context.Background())
+	elapsed := time.Since(start)
+
+	if ok {
+		t.Fatal("expected reconnect to stop when Connect returns object_in_use")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("reconnect took %s; a Connect failure must not use the reconnect budget", elapsed)
+	}
+	if got := conn.connectCount(); got != 1 {
+		t.Fatalf("expected exactly 1 Connect() call, got %d", got)
+	}
+}
+
+func TestReconnectDoesNotRetryEveryObjectInUseError(t *testing.T) {
+	cases := []struct {
+		name    string
+		code    string
+		message string
+	}{
+		{name: "database in use", code: "55006", message: `database "iq" is being accessed by other users`},
+		{name: "invalidated slot", code: "55000", message: `can no longer get changes from replication slot "cdc_slot_lane_0"`},
+		{name: "authentication", code: "28P01", message: "password authentication failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestReconnectStream(config.ReconnectConfig{
+				Enabled: true, InitialDelay: time.Millisecond, MaxDelay: 10 * time.Millisecond,
+				MaxJitter: time.Millisecond, MaxElapsed: time.Hour,
+			})
+			conn := newSlotStatusConn(1_000_000, tc.code, tc.message)
+			s.conn = conn
+
+			start := time.Now()
+			ok := s.reconnect(context.Background())
+			elapsed := time.Since(start)
+
+			if ok {
+				t.Fatal("expected reconnect to stop")
+			}
+			if elapsed > 2*time.Second {
+				t.Fatalf("reconnect took %s; this error must not use the reconnect budget", elapsed)
+			}
+			if got := conn.connectCount(); got != 1 {
+				t.Fatalf("expected exactly 1 Connect() call, got %d", got)
+			}
+		})
 	}
 }

@@ -27,12 +27,12 @@ type Server interface {
 
 type server struct {
 	slotInfoProvider SlotInfoProvider
-	server           http.Server
-	cdcConfig        config.Config
-	closed           bool
 	// shutdownFunc defaults to s.server.Shutdown; overridable in tests to
 	// simulate a shutdown error without needing a real hung connection.
 	shutdownFunc func(ctx context.Context) error
+	server       http.Server
+	cdcConfig    config.Config
+	closed       bool
 }
 
 func NewServer(cfg config.Config, registry metric.Registry, slotInfoProvider SlotInfoProvider) Server {

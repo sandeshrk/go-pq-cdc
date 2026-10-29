@@ -9,6 +9,11 @@ import (
 const (
 	cdcNamespace              = "go_pq_cdc"
 	replicationSlotSubsystem  = "replication_slot"
+	snapshotSubsystem         = "snapshot"
+	reconnectSubsystem        = "reconnect"
+	metricNameTotal           = "total"
+	labelSlotName             = "slot_name"
+	labelHost                 = "host"
 	nanosecondsPerMillisecond = 1_000_000
 )
 
@@ -100,31 +105,31 @@ func NewMetric(slotName string) Metric {
 		totalInsert: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
 			Subsystem: "insert",
-			Name:      "total",
+			Name:      metricNameTotal,
 			Help:      "total number of insert operation message in cdc",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		totalUpdate: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
 			Subsystem: "update",
-			Name:      "total",
+			Name:      metricNameTotal,
 			Help:      "total number of update operation message in cdc",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		totalDelete: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
 			Subsystem: "delete",
-			Name:      "total",
+			Name:      metricNameTotal,
 			Help:      "total number of delete operation message in cdc",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		cdcLatency: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -133,8 +138,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "current",
 			Help:      "latest consumed cdc message latency in nanoseconds",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		cdcLatencyMilliseconds: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -143,8 +148,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "current_milliseconds",
 			Help:      "latest consumed cdc message latency in milliseconds",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		processLatency: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -153,8 +158,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "current",
 			Help:      "latest cdc process latency in nanoseconds",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		processLatencyMilliseconds: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -163,8 +168,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "current_milliseconds",
 			Help:      "latest cdc process latency in milliseconds",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		slotActivity: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -173,8 +178,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "slot_is_active",
 			Help:      "whether the replication slot is active or not",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		slotConfirmedFlushLSN: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -183,8 +188,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "slot_confirmed_flush_lsn",
 			Help:      "last lsn confirmed flushed to the replication slot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		slotCurrentLSN: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -193,8 +198,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "slot_current_lsn",
 			Help:      "current lsn",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		slotRetainedWALSize: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -203,8 +208,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "slot_retained_wal_size",
 			Help:      "current lsn - restart lsn",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		slotLag: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -213,8 +218,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "slot_lag",
 			Help:      "current lsn - confirmed flush lsn",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		unackedLSNLag: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -223,8 +228,8 @@ func NewMetric(slotName string) Metric {
 			Name:      "unacked_lsn_lag",
 			Help:      "highest wal position received by this process minus the highest position acked by the consumer",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		walBacklogWarnings: prometheus.NewCounter(prometheus.CounterOpts{
@@ -233,138 +238,138 @@ func NewMetric(slotName string) Metric {
 			Name:      "wal_backlog_warning_total",
 			Help:      "total number of times WAL was received but nothing had been acked for several consecutive flush intervals",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotInProgress: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "in_progress",
 			Help:      "indicates if snapshot is currently in progress (1) or not (0)",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotTotalTables: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "total_tables",
 			Help:      "total number of tables to snapshot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotCompletedTables: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "completed_tables",
 			Help:      "number of tables completed in snapshot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotTotalRows: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "total_rows",
 			Help:      "total number of rows read during snapshot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotDurationSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "duration_seconds",
 			Help:      "duration of the last snapshot operation in seconds",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotTotalChunks: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "total_chunks",
 			Help:      "total number of chunks in distributed snapshot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotCompletedChunks: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "completed_chunks",
 			Help:      "number of chunks completed in distributed snapshot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		snapshotActiveWorkers: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
+			Subsystem: snapshotSubsystem,
 			Name:      "active_workers",
 			Help:      "number of active worker instances processing distributed snapshot",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		reconnectAttempts: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "reconnect",
+			Subsystem: reconnectSubsystem,
 			Name:      "attempts_total",
 			Help:      "total number of in-process replication reconnect attempts",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		reconnectSuccesses: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "reconnect",
+			Subsystem: reconnectSubsystem,
 			Name:      "success_total",
 			Help:      "total number of successful in-process replication reconnects",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		reconnectFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "reconnect",
+			Subsystem: reconnectSubsystem,
 			Name:      "failure_total",
 			Help:      "total number of in-process replication reconnects that exhausted their budget",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		reconnecting: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "reconnect",
+			Subsystem: reconnectSubsystem,
 			Name:      "in_progress",
 			Help:      "whether an in-process replication reconnect is currently in progress (1) or not (0)",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 		replayedMessages: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
-			Subsystem: "reconnect",
+			Subsystem: reconnectSubsystem,
 			Name:      "replayed_messages_total",
 			Help:      "total number of messages redelivered after an in-process reconnect because they were already delivered before the disconnect",
 			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
+				labelSlotName: slotName,
+				labelHost:     hostname,
 			},
 		}),
 	}
