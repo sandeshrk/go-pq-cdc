@@ -11,7 +11,7 @@ import (
 )
 
 // ApplyPublicationFilters reconciles an already-existing publication's live
-// table membership and row filters (PG 15+) against config: adds tables
+// table membership and row filters against config: adds tables
 // present in config but not yet live, reconciles filter changes on tables
 // already live, and, if PruneTables is set, drops live tables missing from
 // config. New publications get all of this embedded directly in

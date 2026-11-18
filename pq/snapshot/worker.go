@@ -11,17 +11,13 @@ import (
 	"github.com/go-playground/errors"
 )
 
-// waitForCoordinator waits for the coordinator to initialize job and create chunks
-// Workers need both job metadata and chunks to be ready before they can start processing
+var coordinatorWaitInterval = time.Second
+
+// waitForCoordinator waits for published metadata and chunks while the
+// coordinator holds its lock. Slot creation and discovery have no fixed deadline;
+// caller cancellation or loss of the coordinator ends the wait.
 func (s *Snapshotter) waitForCoordinator(ctx context.Context, slotName string) error {
-	timeout := 5 * time.Minute
-	deadline := time.Now().Add(timeout)
-
 	for {
-		if time.Now().After(deadline) {
-			return errors.New("timeout waiting for coordinator to initialize")
-		}
-
 		// Check if both job and chunks are ready
 		yes, status, err := s.isCoordinatorDidItsJob(ctx, slotName)
 		switch {
@@ -34,10 +30,19 @@ func (s *Snapshotter) waitForCoordinator(ctx context.Context, slotName string) e
 			logger.Debug("[worker] waiting for coordinator", "status", status)
 		}
 
+		// A vanished coordinator cannot publish this attempt. Release any
+		// acquired lock through prepare cleanup and let Supervise re-elect.
+		acquired, lockErr := s.tryAcquireCoordinatorLock(ctx, slotName)
+		if lockErr != nil {
+			return lockErr
+		}
+		if acquired {
+			return ErrSnapshotInvalidated
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(1 * time.Second):
+		case <-time.After(coordinatorWaitInterval):
 			// Continue waiting
 		}
 	}
@@ -54,6 +59,9 @@ func (s *Snapshotter) isCoordinatorDidItsJob(ctx context.Context, slotName strin
 	if job == nil {
 		return false, "job not created yet", nil
 	}
+	if job.Completed {
+		return false, "previous snapshot is complete", nil
+	}
 
 	// Step 2: Check if snapshot ID is set (coordinator has exported snapshot)
 	if job.SnapshotID == "" || job.SnapshotID == "PENDING" {
@@ -69,7 +77,8 @@ func (s *Snapshotter) isCoordinatorDidItsJob(ctx context.Context, slotName strin
 		return false, "chunks not created yet", nil
 	}
 
-	// Everything is ready!
+	// Pin this view so Execute cannot silently join a replacement generation.
+	s.cachedSnapshotID = job.SnapshotID
 	return true, fmt.Sprintf("ready (job=%s, chunks=available)", job.SnapshotID), nil
 }
 
@@ -117,7 +126,7 @@ func (s *Snapshotter) executeWorker(ctx context.Context, slotName, instanceID st
 
 	// Process chunks (each chunk will have its own transaction)
 	if err := s.workerProcess(ctx, slotName, instanceID, job, handler); err != nil {
-		return errors.Wrap(err, "worker process")
+		return fmt.Errorf("worker process: %w", err)
 	}
 
 	return nil
@@ -134,8 +143,18 @@ func (s *Snapshotter) workerProcess(ctx context.Context, slotName, instanceID st
 			return err
 		}
 		if !hasMore {
-			logger.Debug("[worker] no more chunks available", "instanceID", instanceID)
-			return nil
+			completed, err := s.checkJobCompleted(ctx, slotName)
+			if err != nil {
+				return err
+			}
+			if completed {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 	}
 }
@@ -144,8 +163,9 @@ func (s *Snapshotter) workerProcess(ctx context.Context, slotName, instanceID st
 func (s *Snapshotter) startHeartbeat(ctx context.Context) (cancel context.CancelFunc, chunkChan chan<- int64) {
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	currentChunk := make(chan int64, 1)
-	go s.heartbeatWorker(heartbeatCtx, currentChunk, s.config.HeartbeatInterval)
-	return cancelHeartbeat, currentChunk
+	done := make(chan struct{})
+	go func() { defer close(done); s.heartbeatWorker(heartbeatCtx, currentChunk, s.config.HeartbeatInterval) }()
+	return func() { cancelHeartbeat(); <-done }, currentChunk
 }
 
 // processNextChunk claims and processes a single chunk
@@ -156,8 +176,17 @@ func (s *Snapshotter) processNextChunk(ctx context.Context, slotName, instanceID
 		return false, ctx.Err()
 	}
 
+	// Refuse to mix chunks from a replacement snapshot generation.
+	current, err := s.loadJob(ctx, slotName)
+	if err != nil {
+		return false, err
+	}
+	if current == nil || current.SnapshotID != job.SnapshotID {
+		return false, ErrSnapshotInvalidated
+	}
+
 	// Claim next chunk
-	chunk, err := s.claimNextChunk(ctx, slotName, instanceID, s.config.ClaimTimeout)
+	chunk, err := s.claimNextChunk(ctx, slotName, instanceID, job.SnapshotID, s.config.ClaimTimeout)
 	if err != nil {
 		return false, errors.Wrap(err, "claim next chunk")
 	}
@@ -185,21 +214,31 @@ func (s *Snapshotter) executeChunkProcessing(ctx context.Context, slotName, inst
 		return s.handleChunkProcessingError(ctx, instanceID, chunk, job.SnapshotID, err)
 	}
 
+	current, loadErr := s.loadJob(ctx, slotName)
+	if loadErr != nil {
+		return false, loadErr
+	}
+	if current == nil || current.SnapshotID != job.SnapshotID {
+		return false, ErrSnapshotInvalidated
+	}
+
 	// Success: mark chunk as completed
-	s.completeChunk(ctx, slotName, instanceID, chunk, rowsProcessed)
+	if err := s.completeChunk(ctx, slotName, instanceID, chunk, rowsProcessed); err != nil {
+		return false, err
+	}
 	return true, nil // More chunks may be available
 }
 
 // handleChunkProcessingError handles different types of chunk processing errors
 func (s *Snapshotter) handleChunkProcessingError(ctx context.Context, instanceID string, chunk *Chunk, snapshotID string, err error) (bool, error) {
 	// Invalid snapshot error: coordinator restarted
-	if isInvalidSnapshotError(err) {
+	if IsInvalidSnapshotError(err) {
 		return s.handleInvalidSnapshot(ctx, instanceID, chunk, snapshotID)
 	}
 
-	// Other errors: log and continue processing
-	logger.Error("[worker] chunk processing failed", "chunkID", chunk.ID, "error", err)
-	return true, nil // Continue with next chunk
+	// A failed chunk cannot be skipped or replaced with a different snapshot.
+	_ = s.releaseChunk(ctx, chunk.ID)
+	return false, err
 }
 
 // handleInvalidSnapshot handles the case when snapshot becomes invalid
@@ -253,11 +292,10 @@ func (s *Snapshotter) notifyHeartbeat(chunkChan chan<- int64, chunkID int64) {
 }
 
 // completeChunk marks chunk as completed and updates metrics
-func (s *Snapshotter) completeChunk(ctx context.Context, slotName, instanceID string, chunk *Chunk, rowsProcessed int64) {
+func (s *Snapshotter) completeChunk(ctx context.Context, slotName, instanceID string, chunk *Chunk, rowsProcessed int64) error {
 	// Mark chunk as completed
 	if err := s.markChunkCompleted(ctx, slotName, chunk.ID, rowsProcessed); err != nil {
-		logger.Warn("[worker] failed to mark chunk as completed", "error", err)
-		return
+		return errors.Wrap(err, "mark chunk completed")
 	}
 
 	// Update metrics
@@ -269,6 +307,7 @@ func (s *Snapshotter) completeChunk(ctx context.Context, slotName, instanceID st
 		"instanceID", instanceID,
 		"chunkID", chunk.ID,
 		"rowsProcessed", rowsProcessed)
+	return nil
 }
 
 // updateCompletedChunksMetric updates the completed chunks metric
@@ -400,16 +439,20 @@ func (s *Snapshotter) heartbeatWorker(ctx context.Context, currentChunk <-chan i
 }
 
 // markJobAsCompleted marks the job as completed (safe to call multiple times)
-func (s *Snapshotter) markJobAsCompleted(ctx context.Context, slotName string) error {
+func (s *Snapshotter) markJobAsCompleted(ctx context.Context, slotName, snapshotID string) error {
 	return s.retryDBOperation(ctx, func() error {
 		query := fmt.Sprintf(`
 			UPDATE %s
 			SET completed = true
-			WHERE slot_name = '%s'
-		`, jobTableName, slotName)
+			WHERE slot_name = '%s' AND snapshot_id = '%s'
+		`, jobTableName, slotName, snapshotID)
 
-		if _, err := s.execQuery(ctx, s.metadataConn, query); err != nil {
+		results, err := s.execQuery(ctx, s.metadataConn, query)
+		if err != nil {
 			return errors.Wrap(err, "mark job as completed")
+		}
+		if len(results) != 1 || results[0].CommandTag.RowsAffected() != 1 {
+			return ErrSnapshotInvalidated
 		}
 
 		logger.Info("[metadata] job marked as completed", "slotName", slotName)
@@ -418,12 +461,12 @@ func (s *Snapshotter) markJobAsCompleted(ctx context.Context, slotName string) e
 }
 
 // claimNextChunk attempts to claim a pending chunk using SELECT FOR UPDATE SKIP LOCKED
-func (s *Snapshotter) claimNextChunk(ctx context.Context, slotName, instanceID string, claimTimeout time.Duration) (*Chunk, error) {
+func (s *Snapshotter) claimNextChunk(ctx context.Context, slotName, instanceID, snapshotID string, claimTimeout time.Duration) (*Chunk, error) {
 	var chunk *Chunk
 
 	err := s.retryDBOperation(ctx, func() error {
 		now := time.Now().UTC()
-		query := s.buildClaimChunkQuery(slotName, instanceID, now, claimTimeout)
+		query := s.buildClaimChunkQuery(slotName, instanceID, snapshotID, now, claimTimeout)
 
 		results, err := s.execQuery(ctx, s.metadataConn, query)
 		if err != nil {
@@ -448,12 +491,13 @@ func (s *Snapshotter) claimNextChunk(ctx context.Context, slotName, instanceID s
 }
 
 // buildClaimChunkQuery builds the SQL query for claiming a chunk
-func (s *Snapshotter) buildClaimChunkQuery(slotName, instanceID string, now time.Time, claimTimeout time.Duration) string {
+func (s *Snapshotter) buildClaimChunkQuery(slotName, instanceID, snapshotID string, now time.Time, claimTimeout time.Duration) string {
 	timeoutThreshold := now.Add(-claimTimeout)
 	return fmt.Sprintf(`
 		WITH available_chunk AS (
 			SELECT id FROM %s
 			WHERE slot_name = '%s'
+			  AND EXISTS (SELECT 1 FROM cdc_snapshot_job j WHERE j.slot_name = '%s' AND j.snapshot_id = '%s')
 			  AND (
 				  status = 'pending'
 				  OR (status = 'in_progress' AND heartbeat_at < '%s')
@@ -474,7 +518,7 @@ func (s *Snapshotter) buildClaimChunkQuery(slotName, instanceID string, now time
 		          c.range_start, c.range_end, c.block_start, c.block_end,
 		          c.is_last_chunk, c.partition_strategy, c.rows_processed
 	`, chunksTableName,
-		slotName,
+		slotName, slotName, snapshotID,
 		timeoutThreshold.Format(postgresTimestampFormat),
 		chunksTableName,
 		instanceID,
@@ -565,38 +609,22 @@ func (s *Snapshotter) updateChunkHeartbeat(ctx context.Context, chunkID int64) e
 	})
 }
 
-// markChunkCompleted marks a chunk as completed and atomically increments completed_chunks
-// NOTE: Uses metadataConn (not workerConn) to avoid serialization conflicts
-// workerConn is in REPEATABLE READ snapshot transaction, metadata updates should be separate
+// markChunkCompleted records chunk completion and progress in one statement.
+// A reclaimed or repeated completion must not increment the job counter twice.
 func (s *Snapshotter) markChunkCompleted(ctx context.Context, slotName string, chunkID, rowsProcessed int64) error {
 	return s.retryDBOperation(ctx, func() error {
-		now := time.Now().UTC()
-
-		// Update chunk status - use metadataConn for metadata updates
-		chunkQuery := fmt.Sprintf(`
-			UPDATE %s
-			SET status = 'completed',
-			    completed_at = '%s',
-			    rows_processed = %d
-			WHERE id = %d
-		`, chunksTableName, now.Format(postgresTimestampFormat), rowsProcessed, chunkID)
-
-		if _, err := s.execQuery(ctx, s.metadataConn, chunkQuery); err != nil {
-			return errors.Wrap(err, "update chunk status")
+		query := fmt.Sprintf(`
+			WITH finished AS (
+				UPDATE %s SET status = 'completed', completed_at = '%s', rows_processed = %d
+				WHERE id = %d AND slot_name = '%s' AND status <> 'completed'
+				RETURNING slot_name
+			)
+			UPDATE %s j SET completed_chunks = completed_chunks + 1
+			FROM finished WHERE j.slot_name = finished.slot_name
+		`, chunksTableName, time.Now().UTC().Format(postgresTimestampFormat), rowsProcessed, chunkID, slotName, jobTableName)
+		if _, err := s.execQuery(ctx, s.metadataConn, query); err != nil {
+			return errors.Wrap(err, "complete chunk and update progress")
 		}
-
-		// Atomically increment completed_chunks counter
-		// Using metadataConn allows multiple workers to safely increment without serialization conflicts
-		jobQuery := fmt.Sprintf(`
-			UPDATE %s
-			SET completed_chunks = completed_chunks + 1
-			WHERE slot_name = '%s'
-		`, jobTableName, slotName)
-
-		if _, err := s.execQuery(ctx, s.metadataConn, jobQuery); err != nil {
-			return errors.Wrap(err, "increment completed chunks")
-		}
-
 		return nil
 	})
 }

@@ -64,13 +64,11 @@ Result: rolled-back streamed transactions are never delivered to handlers.
 
 ### Use `protoVersion: 1` when:
 
-- PostgreSQL version is older than 14
-- You need maximum compatibility with minimal protocol features
+- You need only basic protocol messages
 - You do not require streamed in-progress transaction handling
 
 ### Use `protoVersion: 2` with `streaming: true` when:
 
-- PostgreSQL version is 14+
 - You want support for large/streamed in-progress transactions
 - You want strict rollback safety for streamed transactions
 - Your workload's largest transactions are known to fit in memory (streamed changes are buffered
@@ -103,11 +101,13 @@ Slot: slot.Config{
 
 ## Compatibility Matrix
 
-| slot.protoVersion | slot.streaming | Minimum PostgreSQL | Streaming protocol messages |
-|-------------------|----------------|--------------------|------------------------------|
-| 1                 | n/a            | 10                 | No                           |
-| 2                 | false          | 14                 | No                           |
-| 2                 | true           | 14                 | Yes                          |
+All modes require the [supported PostgreSQL server](../README.md#compatibility).
+
+| slot.protoVersion | slot.streaming | Streaming protocol messages |
+|-------------------|----------------|------------------------------|
+| 1                 | n/a            | No                           |
+| 2                 | false          | No                           |
+| 2                 | true           | Yes                          |
 
 ## Test Coverage Added
 
@@ -131,7 +131,7 @@ If you do not set `slot.protoVersion`, the default is `1`. Streaming is always o
 Recommended migration path:
 
 1. Set `protoVersion: 2` and `streaming: true` explicitly if you rely on streamed in-progress
-   transaction handling on PostgreSQL 14+.
+   transaction handling.
 2. Leave `protoVersion` unset (or `1`) otherwise.
 3. Run your CDC integration tests with both versions if you support mixed environments.
 

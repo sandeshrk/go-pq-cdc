@@ -3,7 +3,6 @@ package snapshot
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/Trendyol/go-pq-cdc/pq"
 
@@ -11,21 +10,14 @@ import (
 	"github.com/go-playground/errors"
 )
 
-// exportSnapshot exports the current transaction snapshot for use by other connections
-// Uses snapshotTxConn which keeps transaction open until all chunks are processed
-// Requires: REPLICATION privilege, wal_level=logical, max_replication_slots>0
+// exportSnapshot exports the SQL view for snapshot-only readers. The caller
+// must retain the exporting transaction until the chunk readers finish.
 func (s *Snapshotter) exportSnapshot(ctx context.Context, exportSnapshotConn pq.Connection) (string, error) {
 	var snapshotID string
 
 	err := s.retryDBOperation(ctx, func() error {
 		results, err := s.execQuery(ctx, exportSnapshotConn, "SELECT pg_export_snapshot()")
 		if err != nil {
-			if strings.Contains(err.Error(), "permission denied") {
-				return errors.New("pg_export_snapshot requires REPLICATION privilege. Run: ALTER USER your_user WITH REPLICATION")
-			}
-			if strings.Contains(err.Error(), "wal_level") {
-				return errors.New("pg_export_snapshot requires wal_level='logical'. Set in postgresql.conf and restart")
-			}
 			return errors.Wrap(err, "export snapshot")
 		}
 

@@ -6,13 +6,15 @@ import (
 
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/Trendyol/go-pq-cdc/pq/snapshot"
 	"github.com/go-playground/errors"
 )
 
-// IsRetryableStartupError reports whether a NewConnector error is worth
+// IsRetryableStartupError reports whether a construction or bootstrap error is worth
 // retrying: the database is unreachable, still starting up, or the tables the
 // publication needs have not been created yet (common when migrations run
-// after this process boots).
+// after this process boots), or a snapshot attempt lost its coordinator/export.
+// Snapshot invalidation requires a fresh connector and a new or rejoined job.
 //
 // Errors returned by this package are wrapped in a go-playground/errors Chain,
 // which has no Unwrap method, so the standard errors.Is/As never see the cause
@@ -35,6 +37,10 @@ func IsRetryableStartupError(err error) bool {
 	}
 
 	if goerrors.Is(cause, publication.ErrorTablesNotExists) {
+		return true
+	}
+
+	if snapshot.IsInvalidSnapshotError(cause) {
 		return true
 	}
 

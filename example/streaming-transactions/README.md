@@ -4,7 +4,7 @@
 
 This example demonstrates PostgreSQL's **streaming in-progress transactions** feature. In normal operation, PostgreSQL accumulates all WAL (Write-Ahead Log) data until a transaction commits, and only then sends it to CDC consumers.
 
-However, with large transactions (such as inserting millions of rows), this approach consumes excessive memory. Starting with PostgreSQL 14, the "streaming" mode allows sending data from uncommitted transactions in chunks:
+However, with large transactions (such as inserting millions of rows), this approach consumes excessive memory. The PostgreSQL "streaming" mode allows sending data from uncommitted transactions in chunks:
 
 ```
 STREAM START  → chunk begins

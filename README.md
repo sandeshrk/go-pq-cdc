@@ -7,23 +7,33 @@ ensuring low resource consumption and high performance.
 
 [Debezium vs go-pq-cdc benchmark](./benchmark)
 
+Requires **PostgreSQL 18.4 or later**. See [Compatibility](#compatibility).
+
 ## Snapshot Feature
 
 **Capture existing data before starting CDC!** The new snapshot feature enables initial data synchronization, ensuring downstream systems receive both historical and real-time data.
 
 ✨ **Key Highlights:**
-- **Zero Data Loss**: Consistent point-in-time snapshot using PostgreSQL's `pg_export_snapshot()`
+- **Zero Data Loss**: Atomic snapshot/stream boundary from PostgreSQL logical slot creation
 - **Chunk-Based Processing**: Memory-efficient processing of large tables
 - **Smart Partitioning**: Auto-selects optimal strategy (Integer Range, CTID Block, or Offset)
 - **Multi-Instance Support**: Parallel processing across multiple instances
-- **Crash Recovery**: Automatic resume from failures
-- **No Duplicates**: Seamless transition from snapshot to CDC
+- **Crash Recovery**: Chunk reclamation within a live export, or a fresh snapshot after coordinator loss
+- **Exact Handoff**: One slot-provided boundary for snapshot and CDC; retries still require idempotent consumers
 - **Snapshot Only Mode**: One-time data export without CDC (no replication slot required)
 - **Protocol Flexibility**: `pgoutput` `proto_version` `1` and `2` support
 - **Safe Streaming TX Handling**: Streamed rollback transactions are discarded correctly
 
 📚 **[Read Full Documentation](docs/SNAPSHOT_FEATURE.md)** for detailed architecture, configuration, and best practices.
 📚 **[Protocol Version & Streaming Transactions](docs/PROTO_VERSION_SUPPORT.md)** for `proto_version` behavior and migration guidance.
+
+Initial snapshots require a fresh slot or explicit `snapshot.resnapshot: true`
+to recreate an inactive slot. An interrupted snapshot restarts from scratch.
+The slot export session stays open and idle until all chunks complete, using
+one walsender. `Supervise` rebuilds invalidated snapshot attempts automatically.
+Snapshot listeners receive the operation context and can call `Close`, including
+from END; a Close requested by END is a successful shutdown, not a snapshot failure.
+Use that context for blocking downstream work. See [snapshot lifecycle and recovery](docs/SNAPSHOT_FEATURE.md#how-it-works).
 
 ### Contents
 
@@ -429,15 +439,15 @@ A few sentinels are plain stdlib errors specifically so `errors.Is` works on the
 | `publication.tables[i].replicaIdentityIndex` |  string  |    no*   |    -    | Unique index name used when `replicaIdentity` is `USING INDEX`.                                        | Required only for `USING INDEX`, ignored otherwise.                                                   |
 | `publication.tables[i].schema`          |  string  |    no    | public  | Set the data change captured table schema name                                                        | Must be a valid table name in the specified database.                                                                                              |
 | `publication.tables[i].columns`                   | []string |    no    |   -   | Only include these columns in replication and snapshotting                                            | Must not be set when `replicaIdentity` is `FULL`; only compatible with `DEFAULT`.                                                                 |
-| `publication.tables[i].partitioned`               |   bool   |    no    | false | Flag for replicating a partitioned table via the root table name instead of listing out the individual table parts. Sets `publish_via_partition_root = true` when creating the publication. | Only avaible with PostgreSQL 13+. This is a publication-wide setting, Setting any table with this will include it for all tables in the publication.                                                                                                                                                   |
+| `publication.tables[i].partitioned`               |   bool   |    no    | false | Flag for replicating a partitioned table via the root table name instead of listing out the individual table parts. Sets `publish_via_partition_root = true` when creating the publication. | This is a publication-wide setting, Setting any table with this will include it for all tables in the publication.                                                                                                                                                   |
 | `publication.tables[i].snapshotPartitionStrategy` |  string  |    no    | auto  | Override partition strategy for snapshot                                                              | **auto:** Auto-detect best strategy (sparse integer PKs fall back to `ctid_block`). **integer_range:** Sequential integer PKs. **ctid_block:** String/UUID/hash/sparse PKs. **offset:** Slow fallback. |
 | `publication.tables[i].queryCondition`  |  string  |    no    |    -    | Per-table query condition for snapshot queries (SNAPSHOT-ONLY, does NOT affect CDC). Takes precedence over global `snapshot.queryCondition`. | Example: `"deleted_at IS NULL"`. Appended to WHERE clause with `AND`. |
-| `publication.tables[i].publicationFilter` |  string  |    no    |    -    | Native Postgres publication row filter (`CREATE`/`ALTER PUBLICATION ... WHERE (...)`). Unlike `queryCondition`, this DOES filter the live CDC/replication stream, not just the initial snapshot. Requires PostgreSQL 15+. | Example: `"status = 'active'"`. Cannot be combined with `replicaIdentity: NOTHING` (Postgres needs the old row to evaluate the filter on UPDATE/DELETE). When `createIfNotExists` is `false` and the publication already exists with a different filter, the connector reconciles it via `ALTER PUBLICATION ... SET TABLE`. Set to `"-"` (`publication.ClearPublicationFilter`) to remove an existing live filter -- an empty/omitted value means "not configured, leave the live filter alone", not "clear it". |
+| `publication.tables[i].publicationFilter` |  string  |    no    |    -    | Native Postgres publication row filter (`CREATE`/`ALTER PUBLICATION ... WHERE (...)`). Unlike `queryCondition`, this DOES filter the live CDC/replication stream, not just the initial snapshot. | Example: `"status = 'active'"`. Cannot be combined with `replicaIdentity: NOTHING` (Postgres needs the old row to evaluate the filter on UPDATE/DELETE). When `createIfNotExists` is `false` and the publication already exists with a different filter, the connector reconciles it via `ALTER PUBLICATION ... SET TABLE`. Set to `"-"` (`publication.ClearPublicationFilter`) to remove an existing live filter -- an empty/omitted value means "not configured, leave the live filter alone", not "clear it". |
 | `publication.pruneTables`               |   bool   |    no    | false | When true, treats `publication.tables` as the full authoritative table membership: any live publication member missing from it is dropped via `ALTER PUBLICATION ... SET TABLE`. | Destructive if `publication.tables` is a deliberate subset -- only enable if config always lists every table that should remain published. Tables present in config but not yet live are always added regardless of this flag (see below). |
 | `slot.createIfNotExists`                |   bool   |    no    |    -    | Create replication slot if not exists. Otherwise, return `replication slot is not exists` error.      |                                                                                                                                                    |
 | `slot.name`                             |  string  |   yes    |    -    | Set the logical replication slot name                                                                 | Should be unique and descriptive.                                                                                                                  |
 | `slot.slotActivityCheckerInterval`      |   int    |    no    |  1000   | Set the slot activity check interval time in milliseconds                                             | Specify as an integer value in milliseconds (e.g., `1000` for 1 second).                                                                           |
-| `slot.protoVersion`                     |   int    |    no    |    2    | `pgoutput` protocol version used in `START_REPLICATION`                                               | `1`: PostgreSQL 10+ compatibility, no streaming transaction protocol messages. `2`: PostgreSQL 14+, enables streaming/messages options.           |
+| `slot.protoVersion`                     |   int    |    no    |    2    | `pgoutput` protocol version used in `START_REPLICATION`                                               | `1`: no streaming transaction protocol messages. `2`: enables streaming/messages options.           |
 | `snapshot.enabled`                      |   bool   |    no    |  false  | Enable initial snapshot feature                                                                       | When enabled, captures existing data before starting CDC.                                                                                          |
 | `snapshot.mode`                         |  string  |    no    |  never  | Snapshot mode: `initial`, `never`, or `snapshot_only`                                                 | **initial:** Take snapshot only if no previous snapshot exists, then start CDC. <br> **never:** Skip snapshot, start CDC immediately. <br> **snapshot_only:** Take snapshot and exit (no CDC, no replication slot required). |
 | `snapshot.chunkSize`                    |  int64   |    no    |  8000   | Number of rows per chunk during snapshot                                                              | Adjust based on table size. Larger chunks = fewer chunks but more memory per chunk.                                                               |
@@ -464,13 +474,11 @@ A few sentinels are plain stdlib errors specifically so `errors.Is` works on the
 `go-pq-cdc` now supports both `pgoutput` protocol versions:
 
 - **`slot.protoVersion: 1`**
-  - Works with PostgreSQL 10+
   - Starts replication with `proto_version '1'`
   - Does not request `messages 'true'` or `streaming 'true'`
-  - Best choice for older PostgreSQL versions or simpler CDC setups
+  - Use for simpler CDC setups without streamed transactions
 
 - **`slot.protoVersion: 2` (default)**
-  - Requires PostgreSQL 14+
   - Starts replication with `proto_version '2'`, `messages 'true'`, and `streaming 'true'`
   - Supports streamed in-progress transactions (`STREAM START/STOP/COMMIT/ABORT`)
 
@@ -518,13 +526,20 @@ Import the grafana dashboard [json file](./grafana/dashboard.json).
 
 ### Compatibility
 
-| go-pq-cdc Version | slot.protoVersion | Minimum PostgreSQL Server Version | Notes |
-|-------------------|-------------------|-----------------------------------|-------|
-| 0.0.2 or higher   | 1                 | 10                                | No streaming transaction protocol messages |
-| 0.0.2 or higher   | 2                 | 14                                | Supports streamed in-progress transactions |
+PostgreSQL 18.4 or later is required for all modes and protocol versions.
+CI tests the minimum server release and the latest PostgreSQL 18 image.
+
+| slot.protoVersion | Streaming transaction protocol messages |
+|-------------------|-----------------------------------------|
+| 1                 | No                                      |
+| 2                 | Supported                               |
+
+For slot timeout, inactivity monitoring, and failover limits, see
+[slot operations](docs/SNAPSHOT_FEATURE.md#slot-operations).
 
 ### Breaking Changes
 
 | Date taking effect | Version | Change | How to check |
 |--------------------|---------|--------|--------------|
+| Next release       | TBD     | PostgreSQL 18.4 or later is required. | Upgrade the server before this library. Migrate existing data volumes with PostgreSQL tools; older server releases are not supported. |
 | Next release       | TBD     | Startup fails when heartbeat is enabled but the heartbeat table is missing from a selective publication. | Ensure `publication.tables` includes your heartbeat table, or use a `FOR ALL TABLES` publication. See [Upgrade: heartbeat table must be in publication](#upgrade-heartbeat-table-must-be-in-publication). |

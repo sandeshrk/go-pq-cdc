@@ -159,24 +159,28 @@ func isTransientError(err error) bool {
 	return false
 }
 
-// isInvalidSnapshotError checks if an error is due to invalid snapshot identifier
-// This occurs when the coordinator's snapshot transaction is closed/expired
-// Common in multi-pod deployments when coordinator restarts
-func isInvalidSnapshotError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for PostgreSQL error code 22023 (invalid_parameter_value) with snapshot message
-	if pgErr, ok := goerrors.AsType[*pgconn.PgError](err); ok {
-		if pgErr.Code == "22023" && strings.Contains(strings.ToLower(pgErr.Message), "invalid snapshot identifier") {
+// IsInvalidSnapshotError reports a lost or invalid exported snapshot through
+// standard or go-playground error wrappers. Nil and unrelated missing objects
+// return false. Retry requires a fresh snapshot attempt, not the lost export.
+func IsInvalidSnapshotError(err error) bool {
+	for cause := err; cause != nil; cause = goerrors.Unwrap(cause) {
+		cause = errors.Cause(cause)
+		if goerrors.Is(cause, ErrSnapshotInvalidated) {
 			return true
 		}
+		if pgErr, ok := goerrors.AsType[*pgconn.PgError](cause); ok {
+			message := strings.ToLower(pgErr.Message)
+			switch pgErr.Code {
+			case "22023":
+				return strings.Contains(message, "invalid snapshot identifier")
+			case "42704":
+				return strings.HasPrefix(message, `snapshot "`) && strings.HasSuffix(message, `" does not exist`)
+			default:
+				return false
+			}
+		}
 	}
-
-	// Fallback to string matching
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "invalid snapshot identifier")
+	return false
 }
 
 func parseNullableInt64(value []byte) (*int64, error) {

@@ -194,6 +194,9 @@ func (s *Slot) Close(ctx context.Context) {
 	if !s.conn.IsClosed() {
 		_ = s.conn.Close(ctx)
 	}
+	if !s.replicationConn.IsClosed() {
+		_ = s.replicationConn.Close(ctx)
+	}
 }
 
 func decodeSlotInfoResult(result *pgconn.Result) (*Info, error) {
