@@ -57,7 +57,7 @@ func (s *Slot) CreateSnapshot(ctx context.Context, recreate bool) (*Snapshot, er
 	if err := s.replicationConn.Connect(ctx); err != nil {
 		return nil, errors.Wrap(err, "slot replication connect")
 	}
-	result, err := s.replicationConn.Exec(ctx, fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput EXPORT_SNAPSHOT", libpq.QuoteIdentifier(s.cfg.Name))).ReadAll()
+	result, err := s.replicationConn.Exec(ctx, fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput (SNAPSHOT 'export')", libpq.QuoteIdentifier(s.cfg.Name))).ReadAll()
 	if err != nil {
 		_ = s.replicationConn.Close(ctx)
 		return nil, errors.Wrap(err, "create snapshot slot")

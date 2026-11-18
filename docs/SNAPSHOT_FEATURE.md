@@ -219,7 +219,7 @@ CREATE TABLE cdc_snapshot_chunks (
 ### Lifecycle Phases
 
 1. Elect a coordinator with a session advisory lock.
-2. Create the logical slot with `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput EXPORT_SNAPSHOT`.
+2. Create the logical slot with `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput (SNAPSHOT 'export')`.
 3. Retain `snapshot_name` and `consistent_point`. Keep the replication export session open and idle.
 4. Open a separate `REPEATABLE READ` transaction and import `snapshot_name` before any query. Discover chunks in this view.
 5. Store that snapshot name and consistent point in the job. Each chunk reader imports the same snapshot in its own `REPEATABLE READ` transaction.
@@ -236,7 +236,7 @@ The replication settings and REPLICATION privilege below apply to `initial` and
 CDC modes. `snapshot_only` uses ordinary SQL connections and needs table reads
 and permission to create/write its metadata tables, not logical replication.
 
-1. **PostgreSQL 14+** with logical replication enabled:
+1. **[Supported PostgreSQL server](../README.md#compatibility)** with logical replication enabled:
    ```sql
    -- Check wal_level
    SHOW wal_level;  -- Must be 'logical'
@@ -687,6 +687,9 @@ in one metadata transaction. A process exit after slot creation therefore leaves
 a recoverable attempt, and other instances cannot accept the previous completed
 generation while slot creation waits.
 Other instances wait for its job metadata, then claim chunks from the same job.
+This wait has no fixed deadline: slot creation can wait for open transactions,
+and chunk discovery can take a long time. Workers stop if their context is
+canceled or the coordinator lock is lost.
 A worker must use a distinct `snapshot.instanceId` when several workers run on
 one host. All instances must use the same source tables and snapshot settings.
 
@@ -711,9 +714,42 @@ Its keepalive is stopped before its transaction closes. The slot export session
 never receives SQL keepalives.
 
 PostgreSQL documents these rules in the
-[slot creation protocol](https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-CREATE-REPLICATION-SLOT)
+[slot creation protocol](https://www.postgresql.org/docs/18/protocol-replication.html#PROTOCOL-REPLICATION-CREATE-REPLICATION-SLOT)
 and [exported snapshots](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPLANATION-EXPORTED-SNAPSHOTS).
-The `EXPORT_SNAPSHOT` syntax also supports the documented minimum PostgreSQL release; see the [PostgreSQL 14 protocol](https://www.postgresql.org/docs/14/protocol-replication.html).
+The slot command uses the parenthesized `SNAPSHOT 'export'` option.
+
+### Slot Operations
+
+The export-holding replication session preserves the snapshot, but **does not
+keep the slot active**. Slot creation releases slot ownership when the command
+returns. In `pg_replication_slots`, `active` is false, `active_pid` is NULL, and
+`inactive_since` is set even while the export session remains open. Do not send
+a keepalive command on that session: it would end the exported snapshot.
+
+PostgreSQL's [`idle_replication_slot_timeout`](https://www.postgresql.org/docs/18/runtime-config-replication.html#GUC-IDLE-REPLICATION-SLOT-TIMEOUT)
+is disabled by default. If enabled, it invalidates an inactive slot at a
+checkpoint after the timeout expires. **This includes the entire initial
+snapshot**, the gap between export close and CDC startup, and shutdown or
+restart. A slow END handler or a long outage extends the inactive period.
+Keep this timeout disabled for initial snapshots, or set it above the longest
+snapshot plus handoff delay and planned downtime. An idle export session alone
+is not protection. Monitor `inactive_since`, `invalidation_reason`, and
+`wal_status`; see
+[`pg_replication_slots`](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).
+An invalidated slot cannot resume its old WAL position. Recover with an explicit
+resnapshot (and replace downstream state), or use a new slot and full snapshot.
+The library does not silently replace a completed job's invalidated stream slot.
+WAL retention limits still apply during a snapshot; size and monitor
+`max_slot_wal_keep_size` for the expected snapshot duration and write rate.
+
+The library does not enable failover slots. Slot creation uses the server's
+`FAILOVER false` default. A server-side failover slot does not preserve the
+exported snapshot, SQL transactions, or coordinator lock across promotion.
+In-progress snapshots must start a fresh attempt after failover. Slot recreation
+for an interrupted job or explicit resnapshot also resets slot options to their
+defaults; it does not preserve an administratively enabled failover flag.
+Operators who configure failover slots must manage synchronization and WAL
+availability themselves. The library makes no automatic failover guarantee.
 
 ### Phase 3: Metadata Creation
 
@@ -735,7 +771,9 @@ workers rather than close the export early. Chunk claims are tied to the job
 snapshot identifier so workers cannot read replacement-job chunks with an old
 snapshot. A prepared worker also pins the snapshot identifier; if it changes
 before execution, the worker must prepare a new attempt. Errors are returned
-by `Run`; `Start` discards its returned error.
+by `Run`; `Start` discards its returned error. Once the job is marked complete,
+`Close` from its END callback is a successful shutdown in both snapshot modes.
+Other END delivery errors and caller cancellation still fail the operation.
 
 ### Phase 5: CDC Continuation
 

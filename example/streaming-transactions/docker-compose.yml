@@ -1,7 +1,7 @@
 version: "3"
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18.4-alpine
     security_opt:
       - no-new-privileges:true
     read_only: true
@@ -34,7 +34,7 @@ services:
       retries: 10
     volumes:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     tmpfs:
       - /tmp
       - /var/run/postgresql

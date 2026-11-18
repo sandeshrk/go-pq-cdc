@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	cdc "github.com/Trendyol/go-pq-cdc"
+	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
@@ -27,40 +27,70 @@ func setReviewBarrier(t *testing.T, hook func(string)) {
 	t.Cleanup(func() { boundaryTestLogger.mu.Lock(); boundaryTestLogger.hook = nil; boundaryTestLogger.mu.Unlock() })
 }
 
-// A subprocess contains the same-goroutine deadlock on the unfixed driver. It
-// reuses the parent database; CommandContext kills only that child PID on timeout.
 func TestReviewSnapshotCloseFromEndHandler(t *testing.T) {
-	if os.Getenv("CDC_REVIEW_CHILD_PORT") == "" {
-		executable, err := os.Executable()
-		require.NoError(t, err)
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, executable, "-test.run=^TestReviewSnapshotCloseFromEndHandler$", "-test.timeout=20s", "-test.v")
-		cmd.Env = append(os.Environ(), "CDC_REVIEW_CHILD_PORT="+strconv.Itoa(Config.Port))
-		output, err := cmd.CombinedOutput()
-		t.Logf("child PID=%d result=%v context=%v\n%s", cmd.Process.Pid, err, ctx.Err(), output)
-		cleanupSnapshotTest(t, context.Background(), "review_close_end", "review_close_end", "review_close_end")
-		require.NoError(t, err, "Close called by the END listener must return")
-		return
+	for _, mode := range []config.SnapshotMode{config.SnapshotModeSnapshotOnly, config.SnapshotModeInitial} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx, _, cfg := snapshotLifecycleSetup(t, "review_close_end_"+string(mode))
+			cfg.Publication.Name = cfg.Slot.Name
+			cfg.Publication.Tables[0].ReplicaIdentity = publication.ReplicaIdentityFull
+			cfg.Snapshot.Mode = mode
+			cfg.Snapshot.ID = cfg.Slot.Name
+			cfg.Snapshot.Tables = cfg.Publication.Tables
+			closed := make(chan struct{})
+			var connector cdc.Connector
+			var err error
+			connector, err = cdc.NewConnector(ctx, cfg, func(lc *replication.ListenerContext) {
+				if m, ok := lc.Message.(*format.Snapshot); ok && m.EventType == format.SnapshotEventTypeEnd {
+					connector.Close()
+					close(closed)
+				}
+			})
+			require.NoError(t, err)
+			t.Cleanup(connector.Close)
+			err = connector.Run(ctx)
+			select {
+			case <-closed:
+			case <-ctx.Done():
+				t.Fatal("END listener Close did not return")
+			}
+			require.NoError(t, err, "Close from a completed snapshot END must be a clean shutdown")
+		})
 	}
-	ctx, _, cfg := snapshotLifecycleSetup(t, "review_close_end")
-	cfg.Publication.Name = cfg.Slot.Name
-	cfg.Publication.Tables[0].ReplicaIdentity = publication.ReplicaIdentityFull
-	cfg.Snapshot.Mode = "snapshot_only"
-	cfg.Snapshot.ID = cfg.Slot.Name
-	cfg.Snapshot.Tables = cfg.Publication.Tables
-	var connector cdc.Connector
-	var err error
-	connector, err = cdc.NewConnector(ctx, cfg, func(lc *replication.ListenerContext) {
-		if m, ok := lc.Message.(*format.Snapshot); ok && m.EventType == format.SnapshotEventTypeEnd {
-			fmt.Println("END listener calling Close")
-			connector.Close()
-			fmt.Println("END listener Close returned")
-		}
-	})
+}
+
+// The child runs the package-internal timing test against this suite's database.
+func TestReviewSnapshotWorkerWaitsForBlockedSlotCreation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "-timeout=45s", "-race", "-count=1", "./pq/snapshot", "-run=^TestWorkerWaitsForBlockedSlotCreation$", "-v")
+	cmd.Dir = ".."
+	cmd.Env = append(os.Environ(), "CDC_REVIEW_WAIT_DSN="+Config.DSN(), "CDC_REVIEW_WAIT_REPLICATION_DSN="+Config.ReplicationDSN())
+	output, err := cmd.CombinedOutput()
+	t.Logf("%s", output)
 	require.NoError(t, err)
-	_ = connector.Run(ctx)
-	connector.Close()
+}
+
+func TestReviewSnapshotEndHandlerError(t *testing.T) {
+	for _, mode := range []config.SnapshotMode{config.SnapshotModeSnapshotOnly, config.SnapshotModeInitial} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx, _, cfg := snapshotLifecycleSetup(t, "review_end_error_"+string(mode))
+			cfg.Snapshot.Mode = mode
+			s, sl := newLifecycleSnapshotter(ctx, t, cfg, "coordinator")
+			if mode == config.SnapshotModeSnapshotOnly {
+				require.NoError(t, s.Prepare(ctx, cfg.Slot.Name))
+			} else {
+				require.NoError(t, s.PrepareWithSlot(ctx, cfg.Slot.Name, sl))
+			}
+			want := fmt.Errorf("END delivery failed")
+			err := s.Execute(ctx, func(event *format.Snapshot) error {
+				if event.EventType == format.SnapshotEventTypeEnd {
+					return want
+				}
+				return nil
+			}, cfg.Slot.Name)
+			require.ErrorContains(t, err, want.Error())
+		})
+	}
 }
 
 func TestReviewSnapshotCloseDeadlineWithBlockedHandler(t *testing.T) {

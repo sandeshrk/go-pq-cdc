@@ -86,6 +86,7 @@ func TestReviewSnapshotInvalidationIsRetryable(t *testing.T) {
 		snapshot.ErrSnapshotInvalidated,
 		errors.Wrap(fmt.Errorf("execute worker: %w", snapshot.ErrSnapshotInvalidated), "snapshot preparation"),
 		errors.Wrap(&pgconn.PgError{Code: "22023", Message: "invalid snapshot identifier: old-export"}, "snapshot import"),
+		errors.Wrap(&pgconn.PgError{Code: "42704", Message: `snapshot "old-export" does not exist`}, "snapshot import"),
 	} {
 		if !IsRetryableStartupError(err) {
 			t.Errorf("snapshot restart must be retryable: %v", err)
@@ -93,5 +94,12 @@ func TestReviewSnapshotInvalidationIsRetryable(t *testing.T) {
 	}
 	if IsRetryableStartupError(&pgconn.PgError{Code: "22023", Message: "invalid parameter unrelated to snapshots"}) {
 		t.Error("unrelated invalid parameters must remain permanent")
+	}
+}
+
+func TestMissingNonSnapshotObjectIsNotRetryable(t *testing.T) {
+	err := errors.Wrap(&pgconn.PgError{Code: "42704", Message: `publication "missing" does not exist`}, "publication")
+	if IsRetryableStartupError(err) {
+		t.Fatal("an unrelated undefined object must not be retried as snapshot invalidation")
 	}
 }

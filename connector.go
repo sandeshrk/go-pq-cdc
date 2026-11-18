@@ -380,6 +380,13 @@ func (c *connector) run(ctx context.Context) error {
 			logger.Error("snapshot preparation failed", "error", err)
 			return errors.Wrap(err, "snapshot preparation")
 		}
+		// END may request Close after the snapshot is complete. Do not open a
+		// stream on sessions that shutdown has already closed.
+		select {
+		case <-c.closedCh:
+			return nil
+		default:
+		}
 	} else {
 		// No snapshot: Create slot normally before starting CDC
 		logger.Info("creating replication slot for CDC")

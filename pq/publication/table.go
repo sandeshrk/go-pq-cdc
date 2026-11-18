@@ -42,7 +42,7 @@ type Table struct {
 	QueryCondition            string                    `json:"queryCondition,omitempty" yaml:"queryCondition,omitempty"`
 	Columns                   []string                  `json:"columns,omitempty" yaml:"columns,omitempty"`
 	// PublicationFilter is a native Postgres publication row filter (CREATE/ALTER
-	// PUBLICATION ... WHERE (...), PG 15+): rows for which it evaluates false/null
+	// PUBLICATION ... WHERE (...)): rows for which it evaluates false/null
 	// are never sent over the replication stream. Unlike QueryCondition, this
 	// DOES affect CDC, not just the initial snapshot. Set to ClearPublicationFilter
 	// to remove an existing live filter (plain "" means "not configured, leave

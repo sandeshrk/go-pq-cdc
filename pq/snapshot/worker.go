@@ -11,17 +11,13 @@ import (
 	"github.com/go-playground/errors"
 )
 
-// waitForCoordinator waits for the coordinator to initialize job and create chunks
-// Workers need both job metadata and chunks to be ready before they can start processing
+var coordinatorWaitInterval = time.Second
+
+// waitForCoordinator waits for published metadata and chunks while the
+// coordinator holds its lock. Slot creation and discovery have no fixed deadline;
+// caller cancellation or loss of the coordinator ends the wait.
 func (s *Snapshotter) waitForCoordinator(ctx context.Context, slotName string) error {
-	timeout := 5 * time.Minute
-	deadline := time.Now().Add(timeout)
-
 	for {
-		if time.Now().After(deadline) {
-			return errors.New("timeout waiting for coordinator to initialize")
-		}
-
 		// Check if both job and chunks are ready
 		yes, status, err := s.isCoordinatorDidItsJob(ctx, slotName)
 		switch {
@@ -46,7 +42,7 @@ func (s *Snapshotter) waitForCoordinator(ctx context.Context, slotName string) e
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(1 * time.Second):
+		case <-time.After(coordinatorWaitInterval):
 			// Continue waiting
 		}
 	}
@@ -236,7 +232,7 @@ func (s *Snapshotter) executeChunkProcessing(ctx context.Context, slotName, inst
 // handleChunkProcessingError handles different types of chunk processing errors
 func (s *Snapshotter) handleChunkProcessingError(ctx context.Context, instanceID string, chunk *Chunk, snapshotID string, err error) (bool, error) {
 	// Invalid snapshot error: coordinator restarted
-	if isInvalidSnapshotError(err) {
+	if IsInvalidSnapshotError(err) {
 		return s.handleInvalidSnapshot(ctx, instanceID, chunk, snapshotID)
 	}
 

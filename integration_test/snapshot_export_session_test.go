@@ -65,3 +65,47 @@ func TestSnapshotExportSessionLifetime(t *testing.T) {
 		t.Fatal("stream did not deliver insert")
 	}
 }
+
+func TestSnapshotExportSessionSlotIdleTimeout(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		name := fmt.Sprintf("snapshot_idle_timeout_%t", complete)
+		t.Run(name, func(t *testing.T) {
+			ctx, admin, cfg := snapshotLifecycleSetup(t, name)
+			setting, err := execQuery(ctx, admin, "SHOW idle_replication_slot_timeout")
+			require.NoError(t, err)
+			previous := string(setting[0].Rows[0][0])
+			t.Cleanup(func() {
+				restoreCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				require.NoError(t, pgExec(restoreCtx, admin, "ALTER SYSTEM SET idle_replication_slot_timeout = '"+previous+"'"))
+				require.NoError(t, pgExec(restoreCtx, admin, "SELECT pg_reload_conf()"))
+				require.Eventually(t, func() bool {
+					results, err := execQuery(restoreCtx, admin, "SHOW idle_replication_slot_timeout")
+					return err == nil && string(results[0].Rows[0][0]) == previous
+				}, 5*time.Second, time.Millisecond)
+			})
+			require.NoError(t, pgExec(ctx, admin, "ALTER SYSTEM SET idle_replication_slot_timeout = '1s'"))
+			require.NoError(t, pgExec(ctx, admin, "SELECT pg_reload_conf()"))
+			require.Eventually(t, func() bool {
+				results, err := execQuery(ctx, admin, "SHOW idle_replication_slot_timeout")
+				return err == nil && string(results[0].Rows[0][0]) == "1s"
+			}, 5*time.Second, time.Millisecond)
+			s, sl := newLifecycleSnapshotter(ctx, t, cfg, "coordinator")
+			require.NoError(t, s.PrepareWithSlot(ctx, cfg.Slot.Name, sl))
+			if complete {
+				require.NoError(t, s.Execute(ctx, func(*format.Snapshot) error { return nil }, cfg.Slot.Name))
+			}
+			stateQuery := "SELECT active, active_pid IS NOT NULL, inactive_since IS NULL, failover, invalidation_reason FROM pg_replication_slots WHERE slot_name = '" + name + "'"
+			state, err := execQuery(ctx, admin, stateQuery)
+			require.NoError(t, err)
+			require.Equal(t, [][]byte{[]byte("f"), []byte("f"), []byte("f"), []byte("f"), nil}, state[0].Rows[0])
+			// Checkpoint-based invalidation needs elapsed server time. Holding
+			// the export does not keep ownership of the replication slot.
+			require.NoError(t, pgExec(ctx, admin, "SELECT pg_sleep(1.1); CHECKPOINT"))
+			state, err = execQuery(ctx, admin, stateQuery)
+			require.NoError(t, err)
+			require.Equal(t, "idle_timeout", string(state[0].Rows[0][4]))
+			t.Logf("snapshot completed=%t: active=f, active_pid=NULL, inactive_since set, failover=f; checkpoint invalidated the inactive slot with idle_timeout", complete)
+		})
+	}
+}

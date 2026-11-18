@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	goerrors "errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -273,4 +274,51 @@ func TestSnapshotDispatcherAllowsCallbackToClose(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("callback Close did not return")
 	}
+}
+
+func TestCompletedSnapshotEndCloseReturnsSuccess(t *testing.T) {
+	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := &Snapshotter{}
+	returned := make(chan struct{})
+	err := s.runOperation(context.Background(), func(ctx context.Context) error {
+		dispatch := snapshotDispatcher(ctx, func(context.Context, *format.Snapshot) error {
+			s.Close(context.Background())
+			close(returned)
+			return nil
+		})
+		return sendSnapshotEnd(ctx, dispatch, &format.Snapshot{EventType: format.SnapshotEventTypeEnd})
+	})
+	require.NoError(t, err)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("END Close did not return")
+	}
+}
+
+func TestCompletedSnapshotEndPreservesOtherErrors(t *testing.T) {
+	for _, want := range []error{goerrors.New("END delivery failed"), context.Canceled, context.DeadlineExceeded} {
+		t.Run(want.Error(), func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			err := sendSnapshotEnd(ctx, func(*format.Snapshot) error { return want }, &format.Snapshot{})
+			require.ErrorIs(t, err, want)
+			cancel(errSnapshotClosed)
+			if !goerrors.Is(want, context.Canceled) {
+				err = sendSnapshotEnd(ctx, func(*format.Snapshot) error { return want }, &format.Snapshot{})
+				require.ErrorIs(t, err, want, "Close must not hide a different delivery error")
+			}
+		})
+	}
+}
+
+func TestCompletedSnapshotEndKeepsCallerCancellation(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx, requestClose := context.WithCancelCause(parent)
+	defer requestClose(nil)
+	cancel()
+	requestClose(errSnapshotClosed)
+	err := sendSnapshotEnd(ctx, func(*format.Snapshot) error { return ctx.Err() }, &format.Snapshot{})
+	require.ErrorIs(t, err, context.Canceled, "Close must not mask cancellation already requested by the caller")
 }

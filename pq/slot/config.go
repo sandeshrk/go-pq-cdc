@@ -10,8 +10,8 @@ type Config struct {
 	Name                        string        `json:"name" yaml:"name"`
 	SlotActivityCheckerInterval time.Duration `json:"slotActivityCheckerInterval" yaml:"slotActivityCheckerInterval"`
 	// ProtoVersion selects the pgoutput logical replication protocol version.
-	//   1 – compatible with PostgreSQL 10+; no streaming transaction support (default).
-	//   2 – requires PostgreSQL 14+; enables Streaming/Messages below.
+	//   1 – no streaming transaction support (default).
+	//   2 – enables Streaming/Messages below.
 	ProtoVersion int `json:"protoVersion" yaml:"protoVersion"`
 	// Streaming enables PostgreSQL sending a large in-progress transaction's
 	// changes before it commits (requires ProtoVersion 2). Off by default: the

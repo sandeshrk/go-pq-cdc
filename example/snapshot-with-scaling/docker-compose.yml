@@ -22,7 +22,7 @@ services:
           memory: 128M
   
   postgres:
-    image: postgres:16.2
+    image: postgres:18.4-alpine
     environment:
       POSTGRES_DB: cdc_db
       POSTGRES_USER: cdc_user

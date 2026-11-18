@@ -3,13 +3,11 @@ package cdc
 import (
 	"context"
 	goerrors "errors"
-	"strings"
 
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/snapshot"
 	"github.com/go-playground/errors"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // IsRetryableStartupError reports whether a construction or bootstrap error is worth
@@ -42,10 +40,7 @@ func IsRetryableStartupError(err error) bool {
 		return true
 	}
 
-	if goerrors.Is(cause, snapshot.ErrSnapshotInvalidated) {
-		return true
-	}
-	if pgErr, ok := goerrors.AsType[*pgconn.PgError](cause); ok && pgErr.Code == "22023" && strings.Contains(strings.ToLower(pgErr.Message), "invalid snapshot identifier") {
+	if snapshot.IsInvalidSnapshotError(cause) {
 		return true
 	}
 

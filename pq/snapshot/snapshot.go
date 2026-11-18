@@ -25,6 +25,9 @@ var (
 	ErrSnapshotInvalidated = goerrors.New("snapshot invalidated by coordinator restart")
 )
 
+// errSnapshotClosed distinguishes requested shutdown from caller cancellation.
+var errSnapshotClosed = goerrors.New("snapshot close requested")
+
 // Handler SnapshotHandler is a function that handles snapshot events
 type Handler func(event *format.Snapshot) error
 
@@ -35,7 +38,7 @@ type ContextHandler func(context.Context, *format.Snapshot) error
 type Snapshotter struct {
 	operationMu        sync.Mutex
 	cancelMu           sync.Mutex
-	operationCancel    context.CancelFunc
+	operationCancel    context.CancelCauseFunc
 	operationDone      chan struct{}
 	resourcesClosed    bool
 	closed             bool
@@ -255,12 +258,23 @@ func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job
 	// Close all connections now that snapshot is complete
 	s.closeAllConnections(ctx, true)
 
-	// Send END marker
-	return handler(&format.Snapshot{
+	// The job is durable before END. Only an explicit Close may turn callback
+	// cancellation into success; caller cancellation and delivery errors remain.
+	return sendSnapshotEnd(ctx, handler, &format.Snapshot{
 		EventType:  format.SnapshotEventTypeEnd,
 		ServerTime: time.Now().UTC(),
 		LSN:        job.SnapshotLSN,
 	})
+}
+
+// sendSnapshotEnd delivers END for a completed job. Close from that callback is
+// a clean shutdown; other callback errors and caller cancellation are returned.
+func sendSnapshotEnd(ctx context.Context, handler Handler, event *format.Snapshot) error {
+	err := handler(event)
+	if goerrors.Is(err, context.Canceled) && goerrors.Is(context.Cause(ctx), errSnapshotClosed) {
+		return nil
+	}
+	return err
 }
 
 // closeAllConnections closes all snapshot connections
@@ -360,7 +374,7 @@ func (s *Snapshotter) Close(ctx context.Context) {
 	s.closed = true
 	done := s.operationDone
 	if s.operationCancel != nil {
-		s.operationCancel()
+		s.operationCancel(errSnapshotClosed)
 	}
 	s.cancelMu.Unlock()
 	if done != nil {
@@ -383,13 +397,13 @@ func (s *Snapshotter) runOperation(ctx context.Context, fn func(context.Context)
 		s.cancelMu.Unlock()
 		return errors.New("snapshotter is closed; build a new one to restart")
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	s.operationCancel = cancel
 	done := make(chan struct{})
 	s.operationDone = done
 	s.cancelMu.Unlock()
 	defer func() {
-		cancel()
+		cancel(nil)
 		s.cancelMu.Lock()
 		s.operationCancel = nil
 		s.operationDone = nil
