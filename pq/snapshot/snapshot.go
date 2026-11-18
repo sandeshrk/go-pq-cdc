@@ -14,6 +14,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/Trendyol/go-pq-cdc/pq/slot"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -28,6 +29,11 @@ var (
 type Handler func(event *format.Snapshot) error
 
 type Snapshotter struct {
+	operationMu        sync.Mutex
+	cancelMu           sync.Mutex
+	operationCancel    context.CancelFunc
+	closed             bool
+	slotSnapshot       *slot.Snapshot
 	healthcheckConn    pq.Connection
 	exportSnapshotConn pq.Connection
 	metric             metric.Metric
@@ -89,38 +95,56 @@ func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publi
 	}, nil
 }
 
-// Prepare sets up snapshot metadata and exports snapshot transaction
-// This must be called BEFORE creating the replication slot to avoid data loss
-// Returns the snapshot LSN that should be used for replication slot creation
-//
-// Flow:
-//  1. Coordinator election
-//  2. Capture current LSN
-//  3. Create metadata (job, chunks)
-//  4. Export snapshot transaction (keeps transaction OPEN)
-//  5. Return LSN for slot creation
-//
-// IMPORTANT: Replication slot MUST be created immediately after this returns
-// to ensure no WAL changes are lost during snapshot execution
+// Prepare sets up a snapshot-only export without a replication boundary.
+// CDC callers must use PrepareWithSlot instead. Execute reads the prepared view.
 func (s *Snapshotter) Prepare(ctx context.Context, slotName string) error {
-	instanceID := generateInstanceID(s.config.InstanceID)
-	logger.Debug("[snapshot] preparing", "instanceID", instanceID)
-
-	isCoordinator, err := s.setupJob(ctx, slotName, instanceID)
-	if err != nil {
-		return errors.Wrap(err, "setup job")
+	if s.config.Mode != config.SnapshotModeSnapshotOnly {
+		return errors.New("initial snapshots require PrepareWithSlot and a fresh slot export")
 	}
+	return s.prepare(ctx, slotName, nil)
+}
 
-	if isCoordinator {
-		logger.Debug("[coordinator] snapshot transaction kept OPEN - replication slot must be created NOW")
+// PrepareWithSlot elects a coordinator and creates an atomic slot snapshot.
+// Workers join the same export; it is retained until all chunks finish or Close.
+func (s *Snapshotter) PrepareWithSlot(ctx context.Context, slotName string, sl *slot.Slot) error {
+	if sl == nil {
+		return errors.New("snapshot replication slot is required")
 	}
-	return nil
+	return s.prepare(ctx, slotName, sl)
+}
+
+// prepare initializes a coordinated generation. A failed setup releases all
+// sessions and the coordinator lock; callers must build a new snapshotter.
+func (s *Snapshotter) prepare(ctx context.Context, slotName string, sl *slot.Slot) error {
+	return s.runOperation(ctx, func(ctx context.Context) error {
+		instanceID := generateInstanceID(s.config.InstanceID)
+		if _, err := s.setupJob(ctx, slotName, instanceID, sl); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			s.closeAllConnections(cleanupCtx, false)
+			return errors.Wrap(err, "setup job")
+		}
+		return nil
+	})
 }
 
 // Execute performs the actual snapshot data collection
-// This should be called AFTER the replication slot is created with the LSN from Prepare()
-// Returns when snapshot is complete
+// Call Prepare or PrepareWithSlot first. It returns after every chunk completes,
+// or fails if the original snapshot can no longer be imported.
 func (s *Snapshotter) Execute(ctx context.Context, handler Handler, slotName string) error {
+	return s.runOperation(ctx, func(ctx context.Context) error { return s.execute(ctx, handler, slotName) })
+}
+
+// execute reads one prepared generation while runOperation owns its sessions.
+func (s *Snapshotter) execute(ctx context.Context, handler Handler, slotName string) error {
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.closeAllConnections(cleanupCtx, false)
+	}()
+	if s.exportSnapshotConn != nil {
+		s.startSnapshotKeepalive(ctx, s.exportSnapshotConn)
+	}
 	startTime := time.Now()
 	instanceID := generateInstanceID(s.config.InstanceID)
 	logger.Debug("[snapshot] executing", "instanceID", instanceID)
@@ -133,7 +157,7 @@ func (s *Snapshotter) Execute(ctx context.Context, handler Handler, slotName str
 
 	// Execute worker processing (ALL instances work, including coordinator)
 	if err := s.executeWorker(ctx, slotName, instanceID, job, handler, startTime); err != nil {
-		return errors.Wrap(err, "execute worker")
+		return fmt.Errorf("execute worker: %w", err)
 	}
 
 	// Finalize (check completion, send END marker)
@@ -153,13 +177,13 @@ func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job
 	}
 
 	if !allCompleted {
-		return nil // Not done yet, keep processing
+		return errors.New("snapshot still has unfinished chunks")
 	}
 
 	logger.Info("[snapshot] all chunks completed, finalizing snapshot")
 
 	// Mark job as completed (idempotent - safe for multiple workers)
-	if err := s.markJobAsCompleted(ctx, slotName); err != nil {
+	if err := s.markJobAsCompleted(ctx, slotName, job.SnapshotID); err != nil {
 		logger.Warn("[snapshot] failed to mark job as completed", "error", err)
 		return err
 	}
@@ -178,10 +202,17 @@ func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job
 // closeAllConnections closes all snapshot connections
 // commitExport: if true, commits the export snapshot transaction; if false, rolls it back
 func (s *Snapshotter) closeAllConnections(ctx context.Context, commitExport bool) {
+	s.cancelMu.Lock()
+	s.closed = true
+	s.cancelMu.Unlock()
 	logger.Info("[snapshot] closing all connections")
 
 	// Close export snapshot connection (coordinator only)
 	s.closeExportSnapshotConnection(ctx, commitExport)
+	if s.slotSnapshot != nil {
+		_ = s.slotSnapshot.Close(ctx)
+		s.slotSnapshot = nil
+	}
 
 	// Close connection pool
 	if s.connectionPool != nil {
@@ -256,8 +287,37 @@ func (s *Snapshotter) Close(ctx context.Context) {
 	if s == nil {
 		return
 	}
-	logger.Debug("[snapshot] closing snapshotter (fallback cleanup)")
-	s.closeAllConnections(ctx, false) // Rollback on abnormal termination
+	s.cancelMu.Lock()
+	s.closed = true
+	if s.operationCancel != nil {
+		s.operationCancel()
+	}
+	s.cancelMu.Unlock()
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	s.closeAllConnections(ctx, false)
+}
+
+// runOperation serializes access to snapshot sessions. Close cancels an active
+// operation and waits for it to leave before closing its connections.
+func (s *Snapshotter) runOperation(ctx context.Context, fn func(context.Context) error) error {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	s.cancelMu.Lock()
+	if s.closed {
+		s.cancelMu.Unlock()
+		return errors.New("snapshotter is closed; build a new one to restart")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	s.operationCancel = cancel
+	s.cancelMu.Unlock()
+	defer func() {
+		cancel()
+		s.cancelMu.Lock()
+		s.operationCancel = nil
+		s.cancelMu.Unlock()
+	}()
+	return fn(ctx)
 }
 
 func (s *Snapshotter) startSnapshotKeepalive(parentCtx context.Context, conn pq.Connection) {

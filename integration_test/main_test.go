@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/go-playground/errors"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -32,12 +33,17 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	os.Exit(runIntegrationTests(m))
+}
+
+func runIntegrationTests(m *testing.M) int {
 	var err error
 	Config, err = config.ReadConfigYAML("./test_connector.yaml")
 	if err != nil {
 		log.Fatal(err)
 	}
 	Config.SetDefault()
+	logger.InitLogger(boundaryTestLogger)
 
 	ctx := context.Background()
 	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true") // Podman: disable Ryuk
@@ -75,7 +81,7 @@ func TestMain(m *testing.M) {
 		log.Fatal(err)
 	}
 
-	m.Run()
+	return m.Run()
 }
 
 func SetupTestContainer(ctx context.Context, cfg config.Config) (testcontainers.Container, error) {

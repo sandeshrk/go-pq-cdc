@@ -12,18 +12,23 @@ ensuring low resource consumption and high performance.
 **Capture existing data before starting CDC!** The new snapshot feature enables initial data synchronization, ensuring downstream systems receive both historical and real-time data.
 
 ✨ **Key Highlights:**
-- **Zero Data Loss**: Consistent point-in-time snapshot using PostgreSQL's `pg_export_snapshot()`
+- **Zero Data Loss**: Atomic snapshot/stream boundary from PostgreSQL logical slot creation
 - **Chunk-Based Processing**: Memory-efficient processing of large tables
 - **Smart Partitioning**: Auto-selects optimal strategy (Integer Range, CTID Block, or Offset)
 - **Multi-Instance Support**: Parallel processing across multiple instances
-- **Crash Recovery**: Automatic resume from failures
-- **No Duplicates**: Seamless transition from snapshot to CDC
+- **Crash Recovery**: Chunk reclamation within a live export, or a fresh snapshot after coordinator loss
+- **Exact Handoff**: One slot-provided boundary for snapshot and CDC; retries still require idempotent consumers
 - **Snapshot Only Mode**: One-time data export without CDC (no replication slot required)
 - **Protocol Flexibility**: `pgoutput` `proto_version` `1` and `2` support
 - **Safe Streaming TX Handling**: Streamed rollback transactions are discarded correctly
 
 📚 **[Read Full Documentation](docs/SNAPSHOT_FEATURE.md)** for detailed architecture, configuration, and best practices.
 📚 **[Protocol Version & Streaming Transactions](docs/PROTO_VERSION_SUPPORT.md)** for `proto_version` behavior and migration guidance.
+
+Initial snapshots require a fresh slot or explicit `snapshot.resnapshot: true`
+to recreate an inactive slot. An interrupted snapshot restarts from scratch.
+The slot export session stays open and idle until all chunks complete, using
+one walsender. See [snapshot lifecycle and recovery](docs/SNAPSHOT_FEATURE.md#how-it-works).
 
 ### Contents
 

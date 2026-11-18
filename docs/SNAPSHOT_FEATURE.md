@@ -42,12 +42,12 @@ Without snapshot support, CDC only captures changes that occur *after* the repli
 
 ### Key Features
 
-✅ **Consistent Point-in-Time Snapshot**: Uses PostgreSQL's `pg_export_snapshot()` for transactional consistency  
+✅ **Consistent Point-in-Time Snapshot**: Uses the snapshot and `consistent_point` returned together by logical slot creation
 ✅ **Chunk-Based Processing**: Splits large tables into manageable chunks for memory efficiency  
 ✅ **Smart Partitioning**: Auto-selects optimal strategy (Integer Range, CTID Block, or Offset) based on table structure  
 ✅ **Snapshot-Consistent Chunk Creation**: All size queries (`pg_relation_size`) run within snapshot transaction for consistency  
 ✅ **Multi-Instance Support**: Multiple instances can collaborate to process chunks in parallel  
-✅ **Crash Recovery**: Automatically resumes from where it left off after failures  
+✅ **Crash Recovery**: Reclaims failed worker chunks while the export is alive; restarts the full snapshot if the coordinator is lost
 ✅ **Zero Data Loss**: Ensures no data is missed between snapshot and CDC phases  
 ✅ **Observability**: Built-in metrics and progress tracking  
 
@@ -218,141 +218,23 @@ CREATE TABLE cdc_snapshot_chunks (
 
 ### Lifecycle Phases
 
-**Mermaid Flow Diagram:**
+1. Elect a coordinator with a session advisory lock.
+2. Create the logical slot with `CREATE_REPLICATION_SLOT ... LOGICAL pgoutput EXPORT_SNAPSHOT`.
+3. Retain `snapshot_name` and `consistent_point`. Keep the replication export session open and idle.
+4. Open a separate `REPEATABLE READ` transaction and import `snapshot_name` before any query. Discover chunks in this view.
+5. Store that snapshot name and consistent point in the job. Each chunk reader imports the same snapshot in its own `REPEATABLE READ` transaction.
+6. Wait for every chunk to complete. Mark the job complete, close the discovery and export sessions, and send END.
+7. Start logical replication from the stored `consistent_point`.
 
-```mermaid
-sequenceDiagram
-    participant I1 as Instance 1
-    participant I2 as Instance 2
-    participant DB as PostgreSQL
-    participant Meta as Metadata Tables
-    
-    Note over I1,I2: Phase 1: Coordinator Election
-    I1->>DB: pg_try_advisory_lock(slot_hash)
-    DB-->>I1: Success ✅ (Coordinator)
-    I2->>DB: pg_try_advisory_lock(slot_hash)
-    DB-->>I2: Fail ❌ (Worker)
-    
-    Note over I1,DB: Phase 2: Snapshot Export (FIRST!)
-    I1->>DB: SELECT pg_current_wal_lsn()
-    DB-->>I1: LSN: 0/12345678
-    I1->>DB: BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
-    I1->>DB: SELECT pg_export_snapshot()
-    DB-->>I1: snapshot_id: "00000003-00000002-1"
-    Note right of I1: Transaction kept OPEN!
-    
-    Note over I1,Meta: Phase 3: Metadata Creation (in snapshot transaction)
-    I1->>DB: SELECT pg_relation_size() (via snapshot conn)
-    Note right of I1: Size queries see same data as workers!
-    I1->>Meta: INSERT INTO cdc_snapshot_job (with snapshot_id)
-    I1->>Meta: INSERT INTO cdc_snapshot_chunks (using snapshot-consistent sizes)
-    
-    Note over I1,I2: Phase 4: Chunk Processing (Parallel)
-    I2->>Meta: Wait for snapshot_id to be ready
-    Meta-->>I2: Ready!
-    
-    par Worker 1 Processing
-        I1->>Meta: Claim chunk 0 (SELECT FOR UPDATE SKIP LOCKED)
-        Meta-->>I1: Chunk 0 claimed
-        I1->>DB: BEGIN + SET TRANSACTION SNAPSHOT
-        I1->>DB: SELECT * FROM table WHERE ctid >= '(0,0)'::tid
-        DB-->>I1: rows from block 0
-        I1->>I1: Send DATA events to handler
-        I1->>DB: COMMIT
-        I1->>Meta: Mark chunk 0 completed
-    and Worker 2 Processing
-        I2->>Meta: Claim chunk 1 (SELECT FOR UPDATE SKIP LOCKED)
-        Meta-->>I2: Chunk 1 claimed
-        I2->>DB: BEGIN + SET TRANSACTION SNAPSHOT
-        I2->>DB: SELECT * FROM table WHERE ctid >= '(1,0)'::tid
-        DB-->>I2: rows from block 1
-        I2->>I2: Send DATA events to handler
-        I2->>DB: COMMIT
-        I2->>Meta: Mark chunk 1 completed
-    end
-    
-    Note over I1,I2: ... Process remaining chunks ...
-    
-    Note over I1,Meta: Phase 5: Finalization
-    I1->>Meta: Check if all chunks completed
-    Meta-->>I1: All completed ✅
-    I1->>Meta: UPDATE job SET completed = true
-    I1->>DB: COMMIT (close snapshot transaction)
-    I1->>I1: Send END event to handler
-    I1->>DB: START_REPLICATION SLOT ... LSN 0/12345678
-    Note over I1: CDC continues from snapshot LSN
-```
-
-**ASCII Diagram:**
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Snapshot Lifecycle                         │
-└──────────────────────────────────────────────────────────────┘
-
-Phase 1: Coordinator Election
-───────────────────────────────
-   ┌─────────┐
-   │Instance1│──pg_try_advisory_lock()──► Success (Coordinator)
-   └─────────┘
-   ┌─────────┐
-   │Instance2│──pg_try_advisory_lock()──► Fail (Worker)
-   └─────────┘
-                    │
-                    ▼
-Phase 2: Snapshot Export (Coordinator Only) ← FIRST!
-──────────────────────────────────────────────────────
-   • Capture current LSN (e.g., 0/12345678)
-   • BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
-   • SELECT pg_export_snapshot() → "00000003-00000002-1"
-   • Keep transaction OPEN (critical!)
-   • Cache snapshot_id for metadata creation
-                    │
-                    ▼
-Phase 3: Metadata Creation (in snapshot transaction)
-─────────────────────────────────────────────────────
-   • Query table sizes via snapshot connection
-     (pg_relation_size sees consistent data!)
-   • Create job metadata with snapshot_id
-   • Split tables into chunks using snapshot-consistent sizes
-   • Auto-select partitioning strategy:
-       - Integer Range: for sequential integer PKs
-       - CTID Block: for string/UUID/hash PKs
-       - Offset: fallback (slow)
-   • Save chunks to DB
-                    │
-                    ▼
-Phase 4: Chunk Processing (All Instances)
-──────────────────────────────────────────
-   Worker Loop:
-   ┌─► Claim next chunk (SELECT FOR UPDATE SKIP LOCKED)
-   │   │
-   │   ├─► BEGIN TRANSACTION
-   │   ├─► SET TRANSACTION SNAPSHOT 'snapshot_id'
-   │   ├─► Execute chunk query (strategy-dependent):
-   │   │   • Integer Range: WHERE id >= X AND id <= Y
-   │   │   • CTID Block: WHERE ctid >= '(block,0)'::tid
-   │   │   • Offset: ORDER BY pk LIMIT X OFFSET Y
-   │   ├─► Send DATA events to handler
-   │   ├─► COMMIT
-   │   ├─► Mark chunk completed
-   │   │
-   └───┴── Repeat until no chunks left
-                    │
-                    ▼
-Phase 5: CDC Continuation
-──────────────────────────
-   • All chunks completed
-   • Snapshot transaction closed
-   • CDC starts from snapshot LSN
-   • No duplicate data!
-```
-
----
+For `snapshot_only`, use a SQL `pg_export_snapshot()` transaction instead. No slot or CDC boundary is needed; event and metadata LSNs are `0/0`.
 
 ## Getting Started
 
 ### Prerequisites
+
+The replication settings and REPLICATION privilege below apply to `initial` and
+CDC modes. `snapshot_only` uses ordinary SQL connections and needs table reads
+and permission to create/write its metadata tables, not logical replication.
 
 1. **PostgreSQL 14+** with logical replication enabled:
    ```sql
@@ -550,7 +432,7 @@ When `resnapshot: true`:
 1. **Cleans metadata for THIS slot only** - Deletes rows from `cdc_snapshot_job` and `cdc_snapshot_chunks` where `slot_name` matches
 2. **Does NOT affect other connectors** - Multiple teams can use different connectors in the same database safely
 3. **Preserves table structure** - Uses DELETE, not DROP TABLE, so indexes and schema remain intact
-4. **Triggers fresh snapshot** - After cleanup, proceeds with normal snapshot flow
+4. **Creates a fresh boundary** - In `initial` mode, drops and recreates the configured inactive replication slot. This discards its old stream position. An active slot is refused. In `snapshot_only` mode, creates a fresh SQL export without a slot.
 
 #### Configuration
 
@@ -774,443 +656,92 @@ snapshot:
 - Use when you don't need historical data
 
 #### `snapshot_only` Mode
+
+Exports table data and exits without CDC, a publication, or a replication slot.
+Specify source tables in `snapshot.tables`. Set `snapshot.id` to a shared job name
+when several instances work on the same export; otherwise the database name
+identifies the job. Completed jobs are skipped unless `resnapshot` is enabled.
+
 ```yaml
 snapshot:
   enabled: true
   mode: snapshot_only
-  chunkSize: 10000
-```
-- Takes snapshot and **exits** (finite mode, no CDC)
-- No replication slot or publication required
-- Process terminates after snapshot completes
-- Similar to Debezium's snapshot-only mode
-- **Multi-pod safe**: Coordinator election enables parallel processing
-- **Resume capability**: Automatically continues if interrupted
-- **Use case**: One-time data export, initial data migration
-
-**Key Differences from `initial` mode:**
-
-| Feature | `initial` Mode | `snapshot_only` Mode |
-|---------|---------------|---------------------|
-| CDC after snapshot | ✅ Yes | ❌ No |
-| Replication slot | ✅ Required | ❌ Not created |
-| Publication | ✅ Required | ❌ Optional |
-| Process behavior | Continuous | Exits after snapshot |
-| Use case | CDC with bootstrap | One-time export |
-
-**Minimal Configuration Example:**
-
-```yaml
-host: localhost
-database: mydb
-username: user
-password: pass
-
-# Publication and slot NOT required for snapshot_only
-# Can be omitted or left empty
-
-publication:
   tables:
     - name: users
       schema: public
-    - name: orders
-      schema: public
-
-snapshot:
-  enabled: true
-  mode: snapshot_only
-  chunkSize: 10000
-
-metric:
-  port: 8081
 ```
 
-**Multi-Pod Deployment:**
-
-Multiple pods can run simultaneously for faster snapshot:
-
-```yaml
-# Same config on all pods
-snapshot:
-  enabled: true
-  mode: snapshot_only
-  chunkSize: 10000
-
-# All pods will:
-# - Use consistent slot name: "snapshot_only_<database>"
-# - Participate in coordinator election (one becomes coordinator)
-# - Process chunks in parallel (work together)
-# - Resume if any pod crashes (no duplicate work)
-```
-
-**Resume on Failure:**
-
-If snapshot is interrupted (pod crash, network issue), simply restart:
-
-```bash
-# Run 1: Process 500/1000 chunks → CRASH
-# Run 2: Automatically continues from chunk 501 ✅
-```
-
-**Output Example:**
-
-```
-INFO: snapshot-only mode enabled, tables=2
-INFO: starting snapshot-only execution slotName=snapshot_only_mydb
-INFO: [snapshot] elected as coordinator instanceID=pod-1-abc123
-INFO: snapshot prepared snapshotLSN=0/12345678
-📸 Snapshot BEGIN | LSN: 0/12345678
-📸 Snapshot DATA | Table: public.users | Data: {"id":1,"name":"Alice"}
-📸 Snapshot DATA | Table: public.users | Data: {"id":2,"name":"Bob"}
-...
-📸 Snapshot END | LSN: 0/12345678
-INFO: snapshot data collection completed snapshotLSN=0/12345678
-INFO: snapshot-only completed successfully, exiting
-```
-
-**Multi-Pod Output Example:**
-
-```
-# Pod 1 (Coordinator):
-INFO: snapshot-only mode enabled, tables=2
-INFO: starting snapshot-only execution slotName=snapshot_only_mydb
-INFO: [coordinator] elected as coordinator instanceID=pod-1
-INFO: [coordinator] chunks created table=users chunks=100
-INFO: [worker] processing chunk table=users chunkIndex=0
-
-# Pod 2 (Worker):
-INFO: snapshot-only mode enabled, tables=2
-INFO: starting snapshot-only execution slotName=snapshot_only_mydb
-INFO: [snapshot] joining as worker instanceID=pod-2
-INFO: [worker] processing chunk table=users chunkIndex=1
-
-# Both pods work together, exit when done
-```
-
----
+All readers import one SQL-exported snapshot. LSNs are `0/0`, not a position from
+which CDC can start. A failed worker chunk can be reclaimed while the coordinator
+is alive. If the export session is gone, restart all participants; the new
+coordinator clears all chunk progress and starts a fresh snapshot. Consumers
+must discard incomplete exports rather than combine rows from different attempts.
 
 ## How It Works
 
 ### Phase 1: Coordinator Election
 
-When multiple instances start simultaneously, they need to elect a coordinator:
-
-```go
-// Each instance tries to acquire advisory lock
-lockID := hashString(slotName)  // e.g., "cdc_slot" -> 12345
-acquired := SELECT pg_try_advisory_lock(lockID)
-
-if acquired {
-    // This instance becomes COORDINATOR
-    // Responsibilities:
-    //   1. Capture current LSN
-    //   2. Export snapshot transaction (FIRST!)
-    //   3. Create job metadata (using snapshot connection)
-    //   4. Split tables into chunks (using snapshot-consistent sizes)
-    //   5. Participate in chunk processing (as worker)
-} else {
-    // This instance becomes WORKER
-    // Responsibilities:
-    //   1. Wait for coordinator to finish setup
-    //   2. Participate in chunk processing
-}
-```
-
-**Key Points:**
-- Uses PostgreSQL advisory locks for coordination
-- Lock is held during setup phase only
-- Advisory locks are automatically released on connection close
-- Workers wait for coordinator by polling job metadata
+The coordinator holds a session advisory lock through the full snapshot.
+Other instances wait for its job metadata, then claim chunks from the same job.
+A worker must use a distinct `snapshot.instanceId` when several workers run on
+one host. All instances must use the same source tables and snapshot settings.
 
 ### Phase 2: Snapshot Export
 
-**IMPORTANT:** Snapshot export happens BEFORE metadata creation to ensure consistency.
+In `initial` mode, slot creation returns the exported snapshot and its stream
+boundary atomically. The discovery connection imports this exact snapshot:
 
-Coordinator exports a PostgreSQL snapshot:
-
-```go
-// 1. Capture current LSN
-currentLSN := SELECT pg_current_wal_lsn()  // e.g., "0/12345678"
-
-// 2. Start transaction (REPEATABLE READ for consistency)
-BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
-
-// 3. Export snapshot and cache the ID
-snapshotID := SELECT pg_export_snapshot()  
-// Returns: "00000003-00000002-1"
-cachedSnapshotID = snapshotID  // Cache for metadata creation
-
-// 4. Keep transaction OPEN!
-// (Do NOT commit/rollback yet)
-// This connection will be used for pg_relation_size queries too!
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT '<snapshot_name from slot creation>';
 ```
 
-**Connection lifecycle safety (important):**
-- The coordinator runs a periodic keepalive (`SELECT 1`) only while the snapshot transaction is active.
-- On snapshot finalization or shutdown, keepalive is stopped first, then the export transaction is finalized (`COMMIT` on success, `ROLLBACK` on abnormal termination), and finally the export connection is closed.
-- This ordering prevents leaked `idle in transaction` sessions and avoids long-lived open transactions that can block `VACUUM`.
+The slot export session must remain idle. **Do not send `SELECT 1`, or any other
+command, on it.** A new command or session close makes the snapshot unavailable
+to new importers. The library retains this session until all chunks finish,
+because chunk retries and late workers also need to import it. This uses one
+walsender during the snapshot, in addition to the normal SQL connections.
 
-**Critical: Why Keep Transaction Open?**
+The discovery transaction uses separate SQL connections for metadata writes.
+Its keepalive is stopped before its transaction closes. The slot export session
+never receives SQL keepalives.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Coordinator Transaction (REPEATABLE READ)                  │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │ BEGIN                                               │    │
-│  │ SELECT pg_export_snapshot() → 'snapshot_123'       │    │
-│  │ SELECT pg_relation_size(...) → consistent size!   │    │
-│  │ ... (transaction stays open) ...                   │    │
-│  │                                                     │    │
-│  │  ┌──────────────────────────────────────────────┐ │    │
-│  │  │ Worker 1: SET TRANSACTION SNAPSHOT 'snap123' │ │    │
-│  │  │ SELECT * FROM users ... (sees same data!)    │ │    │
-│  │  └──────────────────────────────────────────────┘ │    │
-│  │                                                     │    │
-│  │  ┌──────────────────────────────────────────────┐ │    │
-│  │  │ Worker 2: SET TRANSACTION SNAPSHOT 'snap123' │ │    │
-│  │  │ SELECT * FROM orders ... (sees same data!)   │ │    │
-│  │  └──────────────────────────────────────────────┘ │    │
-│  │                                                     │    │
-│  │ COMMIT (after all chunks done)                     │    │
-│  └────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-
-If coordinator closed transaction early:
-  ❌ Snapshot ID becomes invalid
-  ❌ Workers can't use SET TRANSACTION SNAPSHOT
-  ❌ Data inconsistency across chunks
-```
+PostgreSQL documents these rules in the
+[slot creation protocol](https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-CREATE-REPLICATION-SLOT)
+and [exported snapshots](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPLANATION-EXPORTED-SNAPSHOTS).
+The `EXPORT_SNAPSHOT` syntax also supports the documented minimum PostgreSQL release; see the [PostgreSQL 14 protocol](https://www.postgresql.org/docs/14/protocol-replication.html).
 
 ### Phase 3: Metadata Creation
 
-**IMPORTANT:** Metadata creation happens AFTER snapshot export, using the snapshot connection for size queries.
-
-Coordinator creates job and chunk metadata:
-
-```go
-// 1. Create job metadata (with cached snapshot ID)
-INSERT INTO cdc_snapshot_job (
-    slot_name, snapshot_id, snapshot_lsn, started_at,
-    completed, total_chunks, completed_chunks
-) VALUES (
-    'cdc_slot', 'snapshot_123', '0/12345678', NOW(),
-    false, 0, 0
-)
-
-// 2. Split tables into chunks (using snapshot connection for size queries!)
-for each table in publication.tables {
-    // CRITICAL: Query size via snapshot connection for consistency
-    // This ensures pg_relation_size sees the same data as workers
-    totalBlocks := SELECT pg_relation_size(...) / block_size  // via snapshot conn!
-    
-    // Auto-select partitioning strategy
-    strategy := autoDetectStrategy(table)  // integer_range, ctid_block, or offset
-    
-    // Create chunks based on strategy
-    chunks := createChunks(table, strategy, totalBlocks)
-    
-    for chunk in chunks {
-        INSERT INTO cdc_snapshot_chunks (...)
-    }
-}
-```
-
-**Why Use Snapshot Connection for Size Queries?**
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Without snapshot-consistent sizing (BUGGY):                │
-│                                                              │
-│  T0: pg_relation_size() → 1000 blocks (via normal conn)     │
-│  T1: pg_export_snapshot()                                   │
-│  T2: New rows added → 1050 blocks now                       │
-│  T3: Workers process blocks 0-999                           │
-│  ❌ 50 blocks MISSED! Data loss!                            │
-│                                                              │
-├─────────────────────────────────────────────────────────────┤
-│  With snapshot-consistent sizing (CORRECT):                 │
-│                                                              │
-│  T0: pg_export_snapshot()                                   │
-│  T1: pg_relation_size() via snapshot conn → 1000 blocks    │
-│  T2: New rows added → 1050 blocks now (but snapshot sees   │
-│      only 1000!)                                            │
-│  T3: Workers process blocks 0-999 (within snapshot)        │
-│  T4: Last chunk has NO upper bound (safety net)            │
-│  ✅ All snapshot data captured!                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Why Chunks?**
-
-Without chunking:
-```sql
--- ❌ Problem: Loads entire table into memory (OOM risk!)
-SELECT * FROM users;  -- 10M rows → 1GB+ memory
-```
-
-With chunking:
-```sql
--- ✅ Solution: Process in batches (strategy-dependent)
-
--- Integer Range:
-SELECT * FROM users WHERE id >= 1 AND id <= 10000;
-
--- CTID Block:
-SELECT * FROM users WHERE ctid >= '(0,0)'::tid AND ctid < '(100,0)'::tid;
-
--- Offset (slow fallback):
-SELECT * FROM users ORDER BY id LIMIT 10000 OFFSET 0;
-```
+The job stores the slot-provided `snapshot_name` and `consistent_point` as
+`snapshot_id` and `snapshot_lsn`. No separate WAL-position sample is used.
+Chunk discovery reads through the imported discovery transaction. Metadata
+writes occur outside that read transaction so other workers can see them.
 
 ### Phase 4: Chunk Processing
 
-All instances (coordinator + workers) process chunks in parallel:
+Each reader starts `REPEATABLE READ`, imports the job snapshot before querying,
+reads its claimed chunk, and completes that transaction. Completed chunks can
+be skipped only while the same export remains available. A late worker or a
+reconnected reader must import the original snapshot; an import failure stops
+the snapshot. It never substitutes a newer SQL snapshot.
 
-```go
-for {
-    // 1. Claim a chunk (atomic, lock-free)
-    chunk := UPDATE cdc_snapshot_chunks
-             SET status = 'in_progress',
-                 claimed_by = 'instance-123',
-                 claimed_at = NOW(),
-                 heartbeat_at = NOW()
-             WHERE id IN (
-                 SELECT id FROM cdc_snapshot_chunks
-                 WHERE slot_name = 'cdc_slot'
-                   AND (
-                       status = 'pending'
-                       OR (status = 'in_progress' AND heartbeat_at < NOW() - 30s)
-                   )
-                 ORDER BY chunk_index
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED
-             )
-             RETURNING *
-    
-    if chunk == nil {
-        break  // No more chunks
-    }
-    
-    // 2. Process chunk in snapshot transaction
-    BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
-    SET TRANSACTION SNAPSHOT 'snapshot_123'
-    
-    query := SELECT * FROM users 
-             ORDER BY id 
-             LIMIT chunk.chunk_size 
-             OFFSET chunk.chunk_start
-    
-    rows := execute(query)
-    
-    for row in rows {
-        handler(&format.Snapshot{
-            EventType: format.SnapshotEventTypeData,
-            Schema:    "public",
-            Table:     "users",
-            Data:      row,
-            LSN:       snapshotLSN,
-        })
-    }
-    
-    COMMIT
-    
-    // 3. Mark chunk completed
-    UPDATE cdc_snapshot_chunks
-    SET status = 'completed',
-        completed_at = NOW(),
-        rows_processed = len(rows)
-    WHERE id = chunk.id
-    
-    // 4. Update job progress
-    UPDATE cdc_snapshot_job
-    SET completed_chunks = completed_chunks + 1
-    WHERE slot_name = 'cdc_slot'
-}
-```
-
-**Key Features:**
-
-1. **Lock-Free Claiming**: `SELECT FOR UPDATE SKIP LOCKED` prevents contention
-2. **Chunk Isolation**: Each chunk has its own transaction
-3. **Stale Chunk Reclaim**: Chunks with old heartbeats are reclaimed
-4. **Ordered Processing**: `ORDER BY chunk_index` for predictable order
-
-**Heartbeat Mechanism:**
-
-```go
-// Background goroutine per worker
-go func() {
-    ticker := time.NewTicker(10 * time.Second)
-    for {
-        select {
-        case <-ticker.C:
-            UPDATE cdc_snapshot_chunks
-            SET heartbeat_at = NOW()
-            WHERE id = currentChunkID
-        case <-ctx.Done():
-            return
-        }
-    }
-}()
-```
-
-Purpose:
-- Detect crashed/frozen workers
-- Allow other workers to reclaim stale chunks
-- Prevent work duplication
+Workers that temporarily have no unclaimed chunks wait for the remaining
+workers rather than close the export early. Chunk claims are tied to the job
+snapshot identifier so workers cannot read replacement-job chunks with an old
+snapshot. Errors are returned by `Run`; `Start` discards its returned error.
 
 ### Phase 5: CDC Continuation
 
-After all chunks are completed:
+After all chunks finish, the job is marked complete and END carries the stored
+consistent point. The coordinator closes the snapshot sessions. CDC starts from
+that same point. PostgreSQL supplies all changes after the exported view,
+including transactions that were committed in WAL but not yet visible when a
+separate ordinary snapshot would have been taken.
 
-```go
-// 1. Check if all chunks completed
-allDone := SELECT COUNT(*) = COUNT(*) FILTER (WHERE status = 'completed')
-           FROM cdc_snapshot_chunks
-           WHERE slot_name = 'cdc_slot'
-
-if allDone {
-    // 2. Mark job as completed
-    UPDATE cdc_snapshot_job
-    SET completed = true
-    WHERE slot_name = 'cdc_slot'
-    
-    // 3. Close snapshot transaction
-    COMMIT  // (on coordinator's export connection)
-    
-    // 4. Send END marker
-    handler(&format.Snapshot{
-        EventType: format.SnapshotEventTypeEnd,
-        LSN:       snapshotLSN,
-    })
-    
-    // 5. Start CDC from snapshot LSN
-    START_REPLICATION SLOT cdc_slot LOGICAL 0/12345678
-    // CDC stream starts from where snapshot was taken
-}
-```
-
-**Finalization guarantee:**
-- Snapshot finalization always stops the keepalive loop before closing the export transaction.
-- This guarantees there is no background `SELECT 1` running on a finalized connection.
-
-**No Duplicate Data:**
-
-```
-Timeline:
-─────────────────────────────────────────────────────────────►
-         │                    │                    │
-         T0                   T1                   T2
-    Snapshot LSN         Snapshot End         Current Time
-    (0/12345678)
-         │                    │                    │
-         ├────────────────────┤────────────────────►
-         │   Snapshot Data    │    CDC Data        │
-         │   (goes to handler)│  (goes to handler) │
-         │                    │                    │
-         │◄───────────────────┤                    │
-         No overlap!    CDC starts from snapshot LSN
-```
+This boundary does not promise exactly-once delivery after crashes or worker
+retries. Consumers must handle repeated events and discard incomplete snapshot
+attempts before publishing a replacement snapshot.
 
 ### Partitioning Strategies
 
@@ -1274,26 +805,11 @@ SELECT * FROM documents WHERE ctid >= '(200,0)'::tid;  -- Last chunk (no upper b
 - Efficient for large tables with non-integer PKs
 - **10-100x faster** than OFFSET for string PKs
 
-**Critical Implementation Detail - Snapshot-Consistent Block Counts:**
+**Block discovery:**
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  IMPORTANT: pg_relation_size runs WITHIN snapshot transaction   │
-│                                                                  │
-│  Old approach (buggy):                                          │
-│    1. pg_relation_size() → 1000 blocks                          │
-│    2. pg_export_snapshot()                                      │
-│    3. Workers process blocks 0-999                              │
-│    4. ❌ New rows in block 1000+ are MISSED!                    │
-│                                                                  │
-│  New approach (correct):                         │
-│    1. pg_export_snapshot()                                      │
-│    2. pg_relation_size() via snapshot conn → 1000 blocks        │
-│    3. Workers process blocks 0-999                              │
-│    4. ✅ Snapshot sees consistent 1000 blocks                   │
-│    5. ✅ Last chunk has NO upper bound (safety)                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+Block-size queries run on the imported discovery connection. Physical relation
+size is not MVCC-versioned. The final CTID chunk has no upper bound so rows
+visible to the snapshot remain covered even if physical size changes.
 
 **Last Chunk Safety:**
 
@@ -1413,64 +929,26 @@ Timeline:
 
 ### Crash Recovery
 
-The system handles crashes gracefully:
+- **Worker loss, coordinator alive:** Other workers reclaim stale chunks after
+  `claimTimeout` and import the same retained snapshot. A retried chunk can emit
+  repeated rows.
+- **Export session lost:** New imports fail. `Run` returns an error instead of
+  reading under a different snapshot. Stop and restart all participants.
+- **Coordinator or full deployment restart:** The new coordinator finds the
+  incomplete job, recreates the configured inactive slot, deletes all job/chunk
+  progress, and starts with a fresh export and consistent point. It does not
+  resume completed chunks under a different snapshot.
+- **Completed initial job:** Normal restart skips snapshotting and resumes CDC
+  from the slot position. `resnapshot: true` explicitly requests a new snapshot
+  and slot boundary.
+- **Existing slot without a usable snapshot job:** Initial capture is refused
+  with an error. Use a fresh slot name or explicitly set `resnapshot: true` to
+  authorize recreation. No existing active slot is dropped.
 
-#### Scenario 1: Worker Crash During Chunk Processing
-
-```
-Before Crash:
-┌──────────────────────────────────────────────────────────┐
-│ Chunk Status:                                            │
-│   C0: completed (by instance-1)                          │
-│   C1: completed (by instance-2)                          │
-│   C2: in_progress (by instance-3) ← heartbeat stopped    │
-│   C3-C9: pending                                         │
-└──────────────────────────────────────────────────────────┘
-
-After 30s (claimTimeout):
-┌──────────────────────────────────────────────────────────┐
-│ Chunk C2 becomes stale (heartbeat_at < NOW() - 30s)     │
-│ → instance-1 or instance-2 reclaims C2                   │
-│ → C2 reprocessed, no data loss!                          │
-└──────────────────────────────────────────────────────────┘
-```
-
-#### Scenario 2: Coordinator Crash After Metadata Creation
-
-```
-State:
-  ✅ Job metadata created
-  ✅ Chunks created
-  ❌ Snapshot NOT exported yet
-  ❌ Coordinator crashed
-
-On Restart:
-  1. Instance starts, tries to acquire lock
-  2. Detects incomplete job with "PENDING" snapshot_id
-  3. Cleans up incomplete job (DELETE job + chunks)
-  4. Restarts from scratch
-  
-Why? Old snapshot is gone, LSN is stale. 
-     Must restart to maintain consistency.
-```
-
-#### Scenario 3: All Instances Crash, Then Restart
-
-```
-State:
-  ✅ Job exists, snapshot exported
-  ✅ Some chunks completed, some pending/in_progress
-  
-On Restart:
-  1. Instances start
-  2. Coordinator election happens
-  3. Load existing job
-  4. Resume processing:
-     - Skip completed chunks
-     - Reclaim stale in_progress chunks
-     - Process pending chunks
-  5. Continue until all done
-```
+Slot recreation discards the old CDC position. Consumers must replace or clear
+partial snapshot state; restarting the source alone cannot retract rows already
+sent to a downstream system. Use `Run` (or `Supervise`) to observe bootstrap
+errors, and build a new connector for a retry.
 
 ### Schema Migration & Backward Compatibility
 
@@ -1762,20 +1240,11 @@ WHERE slot_name = 'cdc_slot';
 -- They should match!
 ```
 
-### Problem: "permission denied for function pg_export_snapshot"
+### Problem: Snapshot slot creation is denied
 
-**Cause:**
-User doesn't have REPLICATION privilege.
-
-**Solution:**
-```sql
-ALTER USER your_user WITH REPLICATION;
-
--- Verify
-SELECT rolname, rolreplication 
-FROM pg_roles 
-WHERE rolname = 'your_user';
-```
+`initial` mode needs REPLICATION privilege and logical replication settings.
+Check these settings with the database administrator. `snapshot_only` uses SQL
+snapshot export and does not require the REPLICATION attribute.
 
 ### Problem: Chunks Stuck in "in_progress"
 
@@ -1812,27 +1281,11 @@ Worker crashed without cleanup.
 
 ### Problem: "snapshot ... does not exist"
 
-**Full Error:**
-```
-ERROR: snapshot "00000003-00000002-1" does not exist
-```
-
-**Cause:**
-Coordinator's snapshot transaction was closed prematurely.
-
-**Solution:**
-Restart the snapshot process. The system will automatically clean up and restart:
-```bash
-# Stop all instances
-pkill -f go-pq-cdc
-
-# Manually clean up (optional)
-psql -c "DELETE FROM cdc_snapshot_job WHERE slot_name = 'cdc_slot';"
-psql -c "DELETE FROM cdc_snapshot_chunks WHERE slot_name = 'cdc_slot';"
-
-# Restart
-./go-pq-cdc --config config.yml
-```
+The original export session is no longer available. Stop all participants and
+restart with new connectors. Keep the incomplete job metadata: it lets the
+coordinator detect the interrupted attempt and recreate its slot and export.
+Do not manually clear metadata and reuse the old slot; that slot has no
+importable snapshot. Discard partial downstream snapshot state.
 
 ---
 
@@ -1963,7 +1416,7 @@ publication:
 ### Q: What happens if I add a new table to publication during snapshot?
 
 **A:** The new table is ignored for the current snapshot. Options:
-1. Wait for snapshot to complete, then restart to snapshot new table
+1. Finish the current snapshot, then request `resnapshot: true` for a new full snapshot
 2. Manually snapshot new table using a different slot
 
 ### Q: Can I pause and resume snapshot?
@@ -2044,7 +1497,7 @@ The Snapshot Feature provides a robust, scalable solution for initial data captu
 ✅ **Smart Partitioning**: Auto-selects optimal strategy (Integer Range, CTID Block, Offset)  
 ✅ **Snapshot-Consistent**: Size queries run within snapshot transaction
 ✅ **Scalable**: Chunk-based, multi-instance processing  
-✅ **Resilient**: Automatic crash recovery and retry logic  
+✅ **Resilient**: Chunk reclamation within a live export, and a fresh snapshot after coordinator loss
 ✅ **Observable**: Rich metrics and progress tracking  
 ✅ **Production-Ready**: Battle-tested, handles edge cases  
 

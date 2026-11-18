@@ -13,6 +13,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/Trendyol/go-pq-cdc/pq/slot"
 	"github.com/go-playground/errors"
 	libpq "github.com/lib/pq"
 )
@@ -22,46 +23,43 @@ type primaryKeyColumn struct {
 	DataType string
 }
 
-// initializeCoordinator sets up the snapshot job as coordinator
-// 1. Cleanup any incomplete job (from previous crash)
-// 2. Create metadata and chunks
-// 3. Export snapshot for workers
-func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string, currentLSN pq.LSN) error {
-	logger.Debug("[coordinator] initializing job", "slotName", slotName)
-
-	// Check if job already exists
+// initializeCoordinator starts one snapshot generation while holding the
+// coordinator lock. An interrupted generation cannot reuse its lost export.
+func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string, sl *slot.Slot) error {
 	existingJob, err := s.loadJob(ctx, slotName)
-	if err == nil && existingJob != nil && !existingJob.Completed {
-		// Incomplete job found - coordinator crashed during snapshot
-		// PROBLEM: Old snapshot transaction is gone, old LSN is stale
-		// SOLUTION: Restart snapshot from scratch to maintain consistency
-		logger.Warn("[coordinator] incomplete job found, restarting from scratch")
-		logger.Info("[coordinator] reason: stale LSN would cause data duplication")
-
-		if err = s.cleanupJob(ctx, slotName); err != nil {
-			return errors.Wrap(err, "cleanup incomplete job")
+	if err != nil {
+		return errors.Wrap(err, "load previous snapshot job")
+	}
+	recreate := s.config.Resnapshot || (existingJob != nil && !existingJob.Completed)
+	var boundary pq.LSN
+	if sl != nil {
+		exported, err := sl.CreateSnapshot(ctx, recreate)
+		if err != nil {
+			return errors.Wrap(err, "create exact snapshot boundary")
 		}
-
-		logger.Info("[coordinator] cleanup complete, starting fresh")
-		// Fall through to create fresh metadata
+		s.slotSnapshot = exported
+		s.cachedSnapshotID = exported.Name
+		boundary = exported.LSN
 	}
-
-	// IMPORTANT: Export snapshot FIRST, then create chunks within same snapshot view
+	logger.Debug("[coordinator] initializing job", "slotName", slotName)
+	if err := s.cleanupJob(ctx, slotName); err != nil {
+		return errors.Wrap(err, "cleanup snapshot job")
+	}
+	// Record ownership before discovery or row output. PENDING keeps workers
+	// from claiming chunks until discovery has completed for every table.
+	if err := s.saveJob(ctx, &Job{SlotName: slotName, SnapshotID: "PENDING", SnapshotLSN: boundary, StartedAt: time.Now().UTC()}); err != nil {
+		return errors.Wrap(err, "record snapshot attempt")
+	}
 	if err := s.exportSnapshotTransaction(ctx); err != nil {
-		return errors.Wrap(err, "export snapshot")
+		return errors.Wrap(err, "prepare snapshot transaction")
 	}
-
-	// Create metadata and chunks using the snapshot connection
-	// This guarantees chunk boundaries match the exported snapshot
-	if err := s.createMetadata(ctx, slotName, currentLSN); err != nil {
+	if err := s.createMetadata(ctx, slotName, boundary); err != nil {
 		return errors.Wrap(err, "create metadata")
 	}
-
-	logger.Debug("[coordinator] initialization complete")
 	return nil
 }
 
-// createMetadata captures LSN, creates job and chunks metadata
+// createMetadata discovers chunks in the imported view and records the slot boundary.
 func (s *Snapshotter) createMetadata(ctx context.Context, slotName string, currentLSN pq.LSN) error {
 	logger.Info("[coordinator] creating metadata and chunks")
 
@@ -100,9 +98,8 @@ func (s *Snapshotter) createMetadata(ctx context.Context, slotName string, curre
 	return nil
 }
 
-// exportSnapshotTransaction begins a REPEATABLE READ transaction and exports snapshot ID
-// This transaction is kept OPEN for workers to use the same snapshot
-// The snapshot ID is cached and will be used when creating job metadata
+// exportSnapshotTransaction opens the discovery transaction and imports the slot
+// snapshot. Snapshot-only mode exports a SQL snapshot instead, with no CDC LSN.
 func (s *Snapshotter) exportSnapshotTransaction(ctx context.Context) error {
 	exportSnapshotConn, err := pq.NewConnection(ctx, s.dsn)
 	if err != nil {
@@ -146,13 +143,16 @@ func (s *Snapshotter) exportSnapshotTransaction(ctx context.Context) error {
 	}
 
 	// Export snapshot and cache the ID for later use in createMetadata
-	snapshotID, err := s.exportSnapshot(ctx, exportSnapshotConn)
+	snapshotID := s.cachedSnapshotID
+	if s.slotSnapshot != nil {
+		err = s.setTransactionSnapshot(ctx, exportSnapshotConn, snapshotID)
+	} else {
+		snapshotID, err = s.exportSnapshot(ctx, exportSnapshotConn)
+	}
 	if err != nil {
 		cleanupFailedExportConnection()
 		return errors.Wrap(err, "export snapshot")
 	}
-
-	s.startSnapshotKeepalive(ctx, exportSnapshotConn)
 
 	// Cache snapshot ID - will be used when creating job metadata
 	s.cachedSnapshotID = snapshotID
@@ -217,7 +217,7 @@ func (s *Snapshotter) cleanupJob(ctx context.Context, slotName string) error {
 
 // setupJob initializes tables, handles coordinator election, and returns the job
 // Returns: job, isCoordinator flag, error
-func (s *Snapshotter) setupJob(ctx context.Context, slotName, instanceID string) (bool, error) {
+func (s *Snapshotter) setupJob(ctx context.Context, slotName, instanceID string, sl *slot.Slot) (bool, error) {
 	if err := s.initTables(ctx); err != nil {
 		return false, errors.Wrap(err, "initialize tables")
 	}
@@ -228,13 +228,8 @@ func (s *Snapshotter) setupJob(ctx context.Context, slotName, instanceID string)
 	}
 
 	if lockAcquired {
-		currentLSN, err := s.getCurrentLSN(ctx)
-		if err != nil {
-			return false, errors.Wrap(err, "get current LSN")
-		}
-
 		logger.Debug("[snapshot] elected as coordinator", "instanceID", instanceID)
-		if err := s.initializeCoordinator(ctx, slotName, currentLSN); err != nil {
+		if err := s.initializeCoordinator(ctx, slotName, sl); err != nil {
 			return false, errors.Wrap(err, "initialize coordinator")
 		}
 		return true, nil
@@ -370,32 +365,6 @@ func (s *Snapshotter) migrateSchema(ctx context.Context) {
 	}
 
 	logger.Debug("[migration] schema migration completed")
-}
-
-// getCurrentLSN gets the current Write-Ahead Log LSN
-func (s *Snapshotter) getCurrentLSN(ctx context.Context) (pq.LSN, error) {
-	var lsn pq.LSN
-
-	err := s.retryDBOperation(ctx, func() error {
-		results, err := s.execQuery(ctx, s.metadataConn, "SELECT pg_current_wal_lsn()")
-		if err != nil {
-			return errors.Wrap(err, "execute pg_current_wal_lsn")
-		}
-
-		if len(results) == 0 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
-			return errors.New("no LSN returned")
-		}
-
-		lsnStr := string(results[0].Rows[0][0])
-		lsn, err = pq.ParseLSN(lsnStr)
-		if err != nil {
-			return errors.Wrap(err, "parse LSN")
-		}
-
-		return nil
-	})
-
-	return lsn, err
 }
 
 // processChunk processes a single chunk
@@ -1262,6 +1231,10 @@ func (s *Snapshotter) saveJob(ctx context.Context, job *Job) error {
 				slot_name, snapshot_id, snapshot_lsn, started_at, 
 				completed, total_chunks, completed_chunks
 			) VALUES ('%s', '%s', '%s', '%s', %t, %d, %d)
+			ON CONFLICT (slot_name) DO UPDATE SET snapshot_id = EXCLUDED.snapshot_id,
+				snapshot_lsn = EXCLUDED.snapshot_lsn, started_at = EXCLUDED.started_at,
+				completed = EXCLUDED.completed, total_chunks = EXCLUDED.total_chunks,
+				completed_chunks = EXCLUDED.completed_chunks
 		`, jobTableName,
 			job.SlotName,
 			job.SnapshotID,

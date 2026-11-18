@@ -1,11 +1,18 @@
 package snapshot
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/Trendyol/go-pq-cdc/logger"
 
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 //go:fix inline
@@ -215,4 +222,34 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 		assert.Contains(t, q, "WHERE (is_active = true)")
 		assert.Contains(t, q, "ORDER BY id LIMIT 10")
 	})
+}
+
+func TestPrepareRequiresSlotForInitialSnapshot(t *testing.T) {
+	s := &Snapshotter{config: config.SnapshotConfig{Mode: config.SnapshotModeInitial}}
+	require.ErrorContains(t, s.Prepare(context.Background(), "slot"), "fresh slot export")
+	require.ErrorContains(t, s.PrepareWithSlot(context.Background(), "slot", nil), "slot is required")
+}
+
+func TestCloseCancelsAndJoinsActiveSnapshotOperation(t *testing.T) {
+	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := &Snapshotter{}
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.runOperation(context.Background(), func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s.Close(ctx)
+	require.ErrorIs(t, <-done, context.Canceled)
+	s.Close(ctx)
+	require.ErrorContains(t, s.runOperation(ctx, func(context.Context) error {
+		t.Fatal("a closed snapshotter must not start another operation")
+		return nil
+	}), "snapshotter is closed")
 }

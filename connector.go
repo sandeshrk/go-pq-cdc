@@ -260,10 +260,10 @@ func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb
 // initializePublication sets up and creates the publication.
 //
 // Replica identity is applied or checked depending on CreateIfNotExists:
-// - When CreateIfNotExists is true: ApplyReplicaIdentities may ALTER TABLE.
-// - When CreateIfNotExists is false: CheckReplicaIdentities is read-only; any
-//   failure is logged as Error with a manual-action hint and does not stop startup.
-//   See #158 for rationale.
+//   - When CreateIfNotExists is true: ApplyReplicaIdentities may ALTER TABLE.
+//   - When CreateIfNotExists is false: CheckReplicaIdentities is read-only; any
+//     failure is logged as Error with a manual-action hint and does not stop startup.
+//     See #158 for rationale.
 //
 // A freshly created publication already has all of its tables and row
 // filters embedded directly in CREATE PUBLICATION, so ApplyPublicationFilters
@@ -374,8 +374,7 @@ func (c *connector) run(ctx context.Context) error {
 		return nil
 	}
 
-	// Snapshot Pre-phase (optional): Prepare → CreateSlot → Execute
-	// This happens BEFORE the normal CDC flow to avoid data loss
+	// Complete the slot-bound snapshot before opening the replication stream.
 	if c.cfg.Snapshot.Enabled && c.shouldTakeSnapshot(ctx) {
 		if err := c.prepareSnapshotAndSlot(ctx); err != nil {
 			logger.Error("snapshot preparation failed", "error", err)
@@ -496,12 +495,7 @@ func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
 	case config.SnapshotModeNever:
 		return false
 	case config.SnapshotModeInitial:
-		// If resnapshot is enabled, clean metadata for THIS slot only and return true
 		if c.cfg.Snapshot.Resnapshot {
-			logger.Info("resnapshot enabled, cleaning metadata for slot", "slotName", c.cfg.Slot.Name)
-			if err := c.snapshotter.CleanupJobForSlot(ctx, c.cfg.Slot.Name); err != nil {
-				logger.Warn("failed to cleanup job for resnapshot", "error", err)
-			}
 			return true
 		}
 
@@ -517,39 +511,17 @@ func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
 	}
 }
 
-// prepareSnapshotAndSlot handles the snapshot preparation with two-phase approach:
-// 1. Prepare: Capture LSN and create metadata
-// 2. Create replication slot immediately (to preserve WAL)
-// 3. Execute: Collect snapshot data
-// This ensures no WAL changes are lost during snapshot execution
+// prepareSnapshotAndSlot uses the slot creation snapshot as the sole snapshot
+// and stream boundary. Errors stop bootstrap; a new connector restarts the job.
 func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
-	return c.retryOperation("snapshot", 3, func(_ int) error {
-		// Phase 1: Create replication slot immediately (CRITICAL - preserves WAL)
-		slotInfo, err := c.slot.Create(ctx)
-		if err != nil {
-			return errors.Wrap(err, "create slot")
-		}
-		logger.Debug("replication slot created, WAL preserved", "slotName", slotInfo.Name, "restartLSN", slotInfo.RestartLSN.String())
-
-		// Phase 2: Prepare snapshot (capture LSN, create metadata, export snapshot)
-		err = c.snapshotter.Prepare(ctx, c.cfg.Slot.Name)
-		if err != nil {
-			return errors.Wrap(err, "prepare snapshot")
-		}
-		c.stream.OpenFromSnapshotLSN()
-
-		// Phase 3: Execute snapshot (collect data from all chunks)
-		// This may fail if coordinator restarts during execution - retry with backoff
-		if err := c.executeSnapshotWithRetry(ctx); err != nil {
-			if c.isSnapshotInvalidationError(err) {
-				logger.Error("snapshot invalidated and retries exhausted; giving up on this attempt", "error", err)
-			}
-			return errors.Wrap(err, "execute snapshot")
-		}
-
-		logger.Info("snapshot completed successfully")
-		return nil
-	})
+	if err := c.snapshotter.PrepareWithSlot(ctx, c.cfg.Slot.Name, c.slot); err != nil {
+		return errors.Wrap(err, "prepare exact snapshot")
+	}
+	c.stream.OpenFromSnapshotLSN()
+	if err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), c.cfg.Slot.Name); err != nil {
+		return errors.Wrap(err, "execute snapshot; restart connector for a fresh snapshot")
+	}
+	return nil
 }
 
 // executeSnapshotOnly executes snapshot without creating a replication slot
@@ -560,15 +532,13 @@ func (c *connector) executeSnapshotOnly(ctx context.Context) error {
 
 	logger.Info("starting snapshot-only execution", "slotName", slotName)
 
-	// Prepare snapshot (capture LSN, create metadata, export snapshot)
+	// Prepare one SQL snapshot without a CDC boundary.
 	err := c.snapshotter.Prepare(ctx, slotName)
 	if err != nil {
 		return errors.Wrap(err, "prepare snapshot")
 	}
 
 	// Execute snapshot (collect data from all chunks)
-	// Note: We call Execute directly with the slotName we prepared with,
-	// not through executeSnapshotWithRetry which uses c.cfg.Slot.Name
 	if err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), slotName); err != nil {
 		return errors.Wrap(err, "execute snapshot")
 	}
@@ -592,12 +562,7 @@ func (c *connector) getSnapshotOnlySlotName() string {
 func (c *connector) shouldTakeSnapshotOnly(ctx context.Context) bool {
 	slotName := c.getSnapshotOnlySlotName()
 
-	// If resnapshot is enabled, clean metadata for THIS slot only
 	if c.cfg.Snapshot.Resnapshot {
-		logger.Info("resnapshot enabled, cleaning metadata for slot", "slotName", slotName)
-		if err := c.snapshotter.CleanupJobForSlot(ctx, slotName); err != nil {
-			logger.Warn("failed to cleanup job for resnapshot", "error", err)
-		}
 		return true
 	}
 
@@ -615,121 +580,6 @@ func (c *connector) shouldTakeSnapshotOnly(ctx context.Context) bool {
 	// Job exists and completed
 	logger.Info("snapshot-only already completed, skipping", "slotName", slotName)
 	return false
-}
-
-// executeSnapshotWithRetry executes snapshot with retry on coordinator failures
-// When coordinator restarts, it creates a new snapshot - workers should retry to join the new snapshot
-func (c *connector) executeSnapshotWithRetry(ctx context.Context) error {
-	const (
-		maxRetries        = 5
-		initialDelay      = 10 * time.Second
-		maxDelay          = 60 * time.Second
-		backoffMultiplier = 2
-	)
-
-	retryDelay := initialDelay
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), c.cfg.Slot.Name)
-		if err == nil {
-			return nil // Success
-		}
-
-		// Check if this is a recoverable error (snapshot invalidation)
-		if !c.isSnapshotInvalidationError(err) {
-			// Non-recoverable error
-			return err
-		}
-
-		// Last attempt exhausted
-		if attempt >= maxRetries {
-			return errors.Wrap(err, "snapshot execution failed after maximum retries")
-		}
-
-		// Log and wait before retry
-		c.logRetryAttempt(attempt, maxRetries, retryDelay)
-
-		if waitErr := c.waitWithContext(ctx, retryDelay); waitErr != nil {
-			return waitErr
-		}
-
-		// Exponential backoff
-		retryDelay = c.calculateNextDelay(retryDelay, maxDelay, backoffMultiplier)
-	}
-
-	return errors.New("snapshot execution failed: unexpected exit from retry loop")
-}
-
-// isSnapshotInvalidationError checks if error is due to snapshot invalidation
-func (c *connector) isSnapshotInvalidationError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for typed error first (preferred)
-	if goerrors.Is(err, snapshot.ErrSnapshotInvalidated) {
-		return true
-	}
-
-	// Fallback to string matching for wrapped errors
-	return strings.Contains(err.Error(), "snapshot invalidated")
-}
-
-// logRetryAttempt logs snapshot retry attempt with context
-func (c *connector) logRetryAttempt(attempt, maxRetries int, delay time.Duration) {
-	logger.Warn("[snapshot] snapshot invalidated, coordinator likely restarted",
-		"attempt", attempt,
-		"maxRetries", maxRetries,
-		"waitTime", delay)
-
-	logger.Info("[snapshot] waiting for coordinator to create new snapshot",
-		"retryIn", delay)
-}
-
-// waitWithContext waits for duration or context cancellation
-func (c *connector) waitWithContext(ctx context.Context, duration time.Duration) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(duration):
-		return nil
-	}
-}
-
-// calculateNextDelay calculates next retry delay with exponential backoff
-func (c *connector) calculateNextDelay(currentDelay, maxDelay time.Duration, multiplier int) time.Duration {
-	nextDelay := currentDelay * time.Duration(multiplier)
-	if nextDelay > maxDelay {
-		return maxDelay
-	}
-	return nextDelay
-}
-
-// retryOperation executes an operation with retry logic
-func (c *connector) retryOperation(operationName string, maxRetries int, operation func(attempt int) error) error {
-	var lastErr error
-	retryDelay := 5 * time.Second
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if attempt > 1 {
-			logger.Info("retrying operation", "operation", operationName, "attempt", attempt, "maxRetries", maxRetries)
-		}
-
-		if err := operation(attempt); err != nil {
-			lastErr = err
-			logger.Warn("operation failed", "operation", operationName, "attempt", attempt, "error", err)
-
-			if attempt < maxRetries {
-				logger.Info("waiting before retry", "retryDelay", retryDelay.String())
-				time.Sleep(retryDelay)
-			}
-			continue
-		}
-
-		return nil
-	}
-
-	return errors.Wrapf(lastErr, "%s failed after %d retries", operationName, maxRetries)
 }
 
 // snapshotHandlerFor returns a snapshot.Handler bound to ctx, since
