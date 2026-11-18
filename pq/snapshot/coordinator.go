@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -31,6 +32,20 @@ func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string
 		return errors.Wrap(err, "load previous snapshot job")
 	}
 	recreate := s.config.Resnapshot || (existingJob != nil && !existingJob.Completed)
+	// Refuse an unowned existing slot before recording an attempt that would
+	// authorize recreation on a subsequent restart.
+	if sl != nil && !recreate {
+		_, err := sl.Info(ctx)
+		if err == nil {
+			return errors.Newf("exact snapshot requires a new replication slot: %s already exists; use snapshot.resnapshot to recreate it", slotName)
+		}
+		if !goerrors.Is(err, slot.ErrorSlotIsNotExists) {
+			return err
+		}
+	}
+	if err := s.beginSnapshotAttempt(ctx, slotName); err != nil {
+		return err
+	}
 	var boundary pq.LSN
 	if sl != nil {
 		exported, err := sl.CreateSnapshot(ctx, recreate)
@@ -42,19 +57,36 @@ func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string
 		boundary = exported.LSN
 	}
 	logger.Debug("[coordinator] initializing job", "slotName", slotName)
-	if err := s.cleanupJob(ctx, slotName); err != nil {
-		return errors.Wrap(err, "cleanup snapshot job")
-	}
-	// Record ownership before discovery or row output. PENDING keeps workers
-	// from claiming chunks until discovery has completed for every table.
-	if err := s.saveJob(ctx, &Job{SlotName: slotName, SnapshotID: "PENDING", SnapshotLSN: boundary, StartedAt: time.Now().UTC()}); err != nil {
-		return errors.Wrap(err, "record snapshot attempt")
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := s.exportSnapshotTransaction(ctx); err != nil {
 		return errors.Wrap(err, "prepare snapshot transaction")
 	}
 	if err := s.createMetadata(ctx, slotName, boundary); err != nil {
 		return errors.Wrap(err, "create metadata")
+	}
+	return nil
+}
+
+// beginSnapshotAttempt durably replaces the previous job and its chunks before
+// slot creation. A crash after the slot command therefore leaves an incomplete
+// attempt that authorizes recreation, never the previous ready generation.
+func (s *Snapshotter) beginSnapshotAttempt(ctx context.Context, slotName string) error {
+	if err := s.execSQL(ctx, s.metadataConn, "BEGIN"); err != nil {
+		return errors.Wrap(err, "begin snapshot attempt")
+	}
+	defer func() { _ = s.execSQL(ctx, s.metadataConn, "ROLLBACK") }()
+	pending := &Job{SlotName: slotName, SnapshotID: "PENDING", StartedAt: time.Now().UTC()}
+	if err := s.saveJob(ctx, pending); err != nil {
+		return errors.Wrap(err, "record snapshot attempt")
+	}
+	query := fmt.Sprintf("DELETE FROM %s WHERE slot_name = %s", chunksTableName, libpq.QuoteLiteral(slotName))
+	if err := s.execSQL(ctx, s.metadataConn, query); err != nil {
+		return errors.Wrap(err, "clear snapshot chunks")
+	}
+	if err := s.execSQL(ctx, s.metadataConn, "COMMIT"); err != nil {
+		return errors.Wrap(err, "commit snapshot attempt")
 	}
 	return nil
 }

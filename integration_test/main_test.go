@@ -44,6 +44,14 @@ func runIntegrationTests(m *testing.M) int {
 	}
 	Config.SetDefault()
 	logger.InitLogger(boundaryTestLogger)
+	if port := os.Getenv("CDC_REVIEW_CHILD_PORT"); port != "" {
+		Config.Host = "localhost"
+		Config.Port, err = strconv.Atoi(port)
+		if err != nil {
+			panic(err)
+		}
+		return m.Run()
+	}
 
 	ctx := context.Background()
 	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true") // Podman: disable Ryuk

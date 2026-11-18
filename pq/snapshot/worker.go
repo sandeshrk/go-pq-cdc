@@ -34,6 +34,15 @@ func (s *Snapshotter) waitForCoordinator(ctx context.Context, slotName string) e
 			logger.Debug("[worker] waiting for coordinator", "status", status)
 		}
 
+		// A vanished coordinator cannot publish this attempt. Release any
+		// acquired lock through prepare cleanup and let Supervise re-elect.
+		acquired, lockErr := s.tryAcquireCoordinatorLock(ctx, slotName)
+		if lockErr != nil {
+			return lockErr
+		}
+		if acquired {
+			return ErrSnapshotInvalidated
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -54,6 +63,9 @@ func (s *Snapshotter) isCoordinatorDidItsJob(ctx context.Context, slotName strin
 	if job == nil {
 		return false, "job not created yet", nil
 	}
+	if job.Completed {
+		return false, "previous snapshot is complete", nil
+	}
 
 	// Step 2: Check if snapshot ID is set (coordinator has exported snapshot)
 	if job.SnapshotID == "" || job.SnapshotID == "PENDING" {
@@ -69,7 +81,8 @@ func (s *Snapshotter) isCoordinatorDidItsJob(ctx context.Context, slotName strin
 		return false, "chunks not created yet", nil
 	}
 
-	// Everything is ready!
+	// Pin this view so Execute cannot silently join a replacement generation.
+	s.cachedSnapshotID = job.SnapshotID
 	return true, fmt.Sprintf("ready (job=%s, chunks=available)", job.SnapshotID), nil
 }
 

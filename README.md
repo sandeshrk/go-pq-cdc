@@ -28,7 +28,9 @@ ensuring low resource consumption and high performance.
 Initial snapshots require a fresh slot or explicit `snapshot.resnapshot: true`
 to recreate an inactive slot. An interrupted snapshot restarts from scratch.
 The slot export session stays open and idle until all chunks complete, using
-one walsender. See [snapshot lifecycle and recovery](docs/SNAPSHOT_FEATURE.md#how-it-works).
+one walsender. `Supervise` rebuilds invalidated snapshot attempts automatically.
+Snapshot listeners receive the operation context and can call `Close`, including
+from END; use that context for blocking downstream work. See [snapshot lifecycle and recovery](docs/SNAPSHOT_FEATURE.md#how-it-works).
 
 ### Contents
 

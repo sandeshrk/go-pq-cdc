@@ -101,3 +101,13 @@ func TestMergeDesiredPublicationTables(t *testing.T) {
 		assert.Equal(t, "users", desired[0].Name)
 	})
 }
+
+func TestPublicationTablesQueryOmitsUnavailableCatalogFields(t *testing.T) {
+	query := publicationTablesQuery("snapshot_restart", false)
+	assert.NotContains(t, query, "pr.prattrs")
+	assert.NotContains(t, query, "pr.prqual")
+	assert.Contains(t, query, "NULL::text[] AS columns")
+	query = publicationTablesQuery("snapshot_restart", true)
+	assert.Contains(t, query, "pr.prattrs")
+	assert.Contains(t, query, "pr.prqual")
+}

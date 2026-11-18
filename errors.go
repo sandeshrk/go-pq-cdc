@@ -3,16 +3,20 @@ package cdc
 import (
 	"context"
 	goerrors "errors"
+	"strings"
 
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/Trendyol/go-pq-cdc/pq/snapshot"
 	"github.com/go-playground/errors"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// IsRetryableStartupError reports whether a NewConnector error is worth
+// IsRetryableStartupError reports whether a construction or bootstrap error is worth
 // retrying: the database is unreachable, still starting up, or the tables the
 // publication needs have not been created yet (common when migrations run
-// after this process boots).
+// after this process boots), or a snapshot attempt lost its coordinator/export.
+// Snapshot invalidation requires a fresh connector and a new or rejoined job.
 //
 // Errors returned by this package are wrapped in a go-playground/errors Chain,
 // which has no Unwrap method, so the standard errors.Is/As never see the cause
@@ -35,6 +39,13 @@ func IsRetryableStartupError(err error) bool {
 	}
 
 	if goerrors.Is(cause, publication.ErrorTablesNotExists) {
+		return true
+	}
+
+	if goerrors.Is(cause, snapshot.ErrSnapshotInvalidated) {
+		return true
+	}
+	if pgErr, ok := goerrors.AsType[*pgconn.PgError](cause); ok && pgErr.Code == "22023" && strings.Contains(strings.ToLower(pgErr.Message), "invalid snapshot identifier") {
 		return true
 	}
 

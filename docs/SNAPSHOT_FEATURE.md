@@ -682,6 +682,10 @@ must discard incomplete exports rather than combine rows from different attempts
 ### Phase 1: Coordinator Election
 
 The coordinator holds a session advisory lock through the full snapshot.
+Before slot creation, it commits a PENDING job and removes the previous chunks
+in one metadata transaction. A process exit after slot creation therefore leaves
+a recoverable attempt, and other instances cannot accept the previous completed
+generation while slot creation waits.
 Other instances wait for its job metadata, then claim chunks from the same job.
 A worker must use a distinct `snapshot.instanceId` when several workers run on
 one host. All instances must use the same source tables and snapshot settings.
@@ -729,7 +733,9 @@ the snapshot. It never substitutes a newer SQL snapshot.
 Workers that temporarily have no unclaimed chunks wait for the remaining
 workers rather than close the export early. Chunk claims are tied to the job
 snapshot identifier so workers cannot read replacement-job chunks with an old
-snapshot. Errors are returned by `Run`; `Start` discards its returned error.
+snapshot. A prepared worker also pins the snapshot identifier; if it changes
+before execution, the worker must prepare a new attempt. Errors are returned
+by `Run`; `Start` discards its returned error.
 
 ### Phase 5: CDC Continuation
 
@@ -933,7 +939,11 @@ Timeline:
   `claimTimeout` and import the same retained snapshot. A retried chunk can emit
   repeated rows.
 - **Export session lost:** New imports fail. `Run` returns an error instead of
-  reading under a different snapshot. Stop and restart all participants.
+  reading under a different snapshot. `Supervise` classifies snapshot invalidation
+  and PostgreSQL invalid-snapshot-identifier import errors as retryable bootstrap
+  errors. It closes the failed connector and builds a fresh one that becomes
+  coordinator or joins the new job. Direct `Run` callers must rebuild it.
+  Caller cancellation and unrelated invalid parameters are not retried.
 - **Coordinator or full deployment restart:** The new coordinator finds the
   incomplete job, recreates the configured inactive slot, deletes all job/chunk
   progress, and starts with a fresh export and consistent point. It does not
@@ -949,6 +959,20 @@ Slot recreation discards the old CDC position. Consumers must replace or clear
 partial snapshot state; restarting the source alone cannot retract rows already
 sent to a downstream system. Use `Run` (or `Supervise`) to observe bootstrap
 errors, and build a new connector for a retry.
+
+### Snapshot callback shutdown
+
+Snapshot callbacks run serially, outside the database operation. The connector
+passes the operation context as `ListenerContext.Context`; `Close` cancels it,
+so handlers must use that context for backpressure and other blocking work.
+Calling `connector.Close()` from a snapshot callback, including END, is safe.
+
+`Snapshotter.Close(ctx)` waits for the database operation only until the caller's
+context ends. Database cleanup can finish after that deadline. It does not wait
+on the callback that requested shutdown. A callback that ignores cancellation
+can leave its own goroutine blocked; Go cannot stop arbitrary user code. No more
+callbacks are delivered for that operation, and its database sessions are closed.
+Direct snapshot users can use `ExecuteWithContext` for cancellation-aware handlers.
 
 ### Schema Migration & Backward Compatibility
 

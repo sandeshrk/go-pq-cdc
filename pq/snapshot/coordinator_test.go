@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
@@ -252,4 +253,24 @@ func TestCloseCancelsAndJoinsActiveSnapshotOperation(t *testing.T) {
 		t.Fatal("a closed snapshotter must not start another operation")
 		return nil
 	}), "snapshotter is closed")
+}
+
+func TestSnapshotDispatcherAllowsCallbackToClose(t *testing.T) {
+	logger.InitLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := &Snapshotter{}
+	returned := make(chan struct{})
+	err := s.runOperation(context.Background(), func(ctx context.Context) error {
+		handler := snapshotDispatcher(ctx, func(context.Context, *format.Snapshot) error {
+			s.Close(context.Background())
+			close(returned)
+			return nil
+		})
+		return handler(&format.Snapshot{})
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("callback Close did not return")
+	}
 }

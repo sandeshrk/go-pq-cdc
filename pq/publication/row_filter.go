@@ -119,22 +119,14 @@ func mergeDesiredPublicationTables(actual, configured Tables, pruneTables bool) 
 // list on SET TABLE -- and Postgres rejects an explicit column list (even one
 // naming every column) combined with REPLICA IDENTITY FULL.
 func (c *Publication) GetPublicationTables(ctx context.Context) (Tables, error) {
-	query := fmt.Sprintf(`
-		SELECT
-			n.nspname AS schema_name,
-			c.relname AS table_name,
-			CASE WHEN pr.prattrs IS NOT NULL THEN (
-				SELECT array_agg(a.attname ORDER BY a.attnum)
-				FROM pg_attribute a
-				WHERE a.attrelid = pr.prrelid AND a.attnum = ANY(pr.prattrs)
-			) END AS columns,
-			pg_get_expr(pr.prqual, pr.prrelid) AS row_filter
-		FROM pg_publication_rel pr
-		JOIN pg_class c ON c.oid = pr.prrelid
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		JOIN pg_publication p ON p.oid = pr.prpubid
-		WHERE p.pubname = %s
-	`, pq.QuoteLiteral(c.cfg.Name))
+	capabilities, err := c.conn.Exec(ctx, "SELECT current_setting('server_version_num')::integer >= 150000").ReadAll()
+	if err != nil {
+		return nil, errors.Wrap(err, "publication table capabilities")
+	}
+	if len(capabilities) != 1 || len(capabilities[0].Rows) != 1 || len(capabilities[0].Rows[0]) != 1 {
+		return nil, errors.New("missing publication table capabilities")
+	}
+	query := publicationTablesQuery(c.cfg.Name, string(capabilities[0].Rows[0][0]) == "t")
 
 	logger.Debug("executing query: ", query)
 
@@ -153,6 +145,28 @@ func (c *Publication) GetPublicationTables(ctx context.Context) (Tables, error) 
 	}
 
 	return decodePublicationTablesResult(results)
+}
+
+// publicationTablesQuery reads live membership without requiring column-list
+// and row-filter catalog fields on servers that do not support those features.
+func publicationTablesQuery(name string, supportsFilters bool) string {
+	fields := "NULL::text[] AS columns, NULL::text AS row_filter"
+	if supportsFilters {
+		fields = `CASE WHEN pr.prattrs IS NOT NULL THEN (
+			SELECT array_agg(a.attname ORDER BY a.attnum)
+			FROM pg_attribute a
+			WHERE a.attrelid = pr.prrelid AND a.attnum = ANY(pr.prattrs)
+		) END AS columns,
+		pg_get_expr(pr.prqual, pr.prrelid) AS row_filter`
+	}
+	return fmt.Sprintf(`
+		SELECT n.nspname AS schema_name, c.relname AS table_name, %s
+		FROM pg_publication_rel pr
+		JOIN pg_class c ON c.oid = pr.prrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_publication p ON p.oid = pr.prpubid
+		WHERE p.pubname = %s
+	`, fields, pq.QuoteLiteral(name))
 }
 
 func decodePublicationTablesResult(results []*pgconn.Result) (Tables, error) {

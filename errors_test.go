@@ -3,10 +3,12 @@ package cdc
 import (
 	"context"
 	goerrors "errors"
+	"fmt"
 	"net"
 	"testing"
 
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/Trendyol/go-pq-cdc/pq/snapshot"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -76,5 +78,20 @@ func TestIsRetryableStartupError(t *testing.T) {
 				t.Fatalf("IsRetryableStartupError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestReviewSnapshotInvalidationIsRetryable(t *testing.T) {
+	for _, err := range []error{
+		snapshot.ErrSnapshotInvalidated,
+		errors.Wrap(fmt.Errorf("execute worker: %w", snapshot.ErrSnapshotInvalidated), "snapshot preparation"),
+		errors.Wrap(&pgconn.PgError{Code: "22023", Message: "invalid snapshot identifier: old-export"}, "snapshot import"),
+	} {
+		if !IsRetryableStartupError(err) {
+			t.Errorf("snapshot restart must be retryable: %v", err)
+		}
+	}
+	if IsRetryableStartupError(&pgconn.PgError{Code: "22023", Message: "invalid parameter unrelated to snapshots"}) {
+		t.Error("unrelated invalid parameters must remain permanent")
 	}
 }

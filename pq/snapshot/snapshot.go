@@ -28,10 +28,16 @@ var (
 // Handler SnapshotHandler is a function that handles snapshot events
 type Handler func(event *format.Snapshot) error
 
+// ContextHandler receives the snapshot operation context, canceled by Close.
+// Handlers should honor cancellation when blocked on downstream work.
+type ContextHandler func(context.Context, *format.Snapshot) error
+
 type Snapshotter struct {
 	operationMu        sync.Mutex
 	cancelMu           sync.Mutex
 	operationCancel    context.CancelFunc
+	operationDone      chan struct{}
+	resourcesClosed    bool
 	closed             bool
 	slotSnapshot       *slot.Snapshot
 	healthcheckConn    pq.Connection
@@ -132,7 +138,61 @@ func (s *Snapshotter) prepare(ctx context.Context, slotName string, sl *slot.Slo
 // Call Prepare or PrepareWithSlot first. It returns after every chunk completes,
 // or fails if the original snapshot can no longer be imported.
 func (s *Snapshotter) Execute(ctx context.Context, handler Handler, slotName string) error {
-	return s.runOperation(ctx, func(ctx context.Context) error { return s.execute(ctx, handler, slotName) })
+	return s.ExecuteWithContext(ctx, func(_ context.Context, event *format.Snapshot) error { return handler(event) }, slotName)
+}
+
+// ExecuteWithContext reads the prepared snapshot with cancelable, serialized
+// callbacks. A callback may call Close. An uncooperative callback cannot prevent
+// session cleanup, but its goroutine remains until the callback returns.
+func (s *Snapshotter) ExecuteWithContext(ctx context.Context, handler ContextHandler, slotName string) error {
+	return s.runOperation(ctx, func(ctx context.Context) error {
+		dispatchCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		dispatch := snapshotDispatcher(dispatchCtx, handler)
+		return s.execute(ctx, dispatch, slotName)
+	})
+}
+
+// snapshotDispatcher serializes callbacks outside the database operation. The
+// operation can leave on cancellation without waiting on the callback that
+// requested Close, or on a downstream listener that ignores cancellation.
+func snapshotDispatcher(ctx context.Context, handler ContextHandler) Handler {
+	requests := make(chan *format.Snapshot)
+	results := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-requests:
+				if ctx.Err() != nil {
+					return
+				}
+				err := handler(ctx, event)
+				select {
+				case results <- err:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return func(event *format.Snapshot) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case requests <- event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case err := <-results:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // execute reads one prepared generation while runOperation owns its sessions.
@@ -153,6 +213,10 @@ func (s *Snapshotter) execute(ctx context.Context, handler Handler, slotName str
 	job, err := s.loadJob(ctx, slotName)
 	if err != nil || job == nil {
 		return errors.New("job not found - Prepare() must be called first")
+	}
+
+	if job.SnapshotID != s.cachedSnapshotID {
+		return ErrSnapshotInvalidated
 	}
 
 	// Execute worker processing (ALL instances work, including coordinator)
@@ -204,6 +268,11 @@ func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job
 func (s *Snapshotter) closeAllConnections(ctx context.Context, commitExport bool) {
 	s.cancelMu.Lock()
 	s.closed = true
+	if s.resourcesClosed {
+		s.cancelMu.Unlock()
+		return
+	}
+	s.resourcesClosed = true
 	s.cancelMu.Unlock()
 	logger.Info("[snapshot] closing all connections")
 
@@ -280,21 +349,27 @@ func (s *Snapshotter) closeExportSnapshotConnection(ctx context.Context, commit 
 	s.keepaliveMu.Unlock()
 }
 
-// Close closes all connections held by the Snapshotter
-// Safe to call multiple times (idempotent)
-// This is a fallback for cleanup in case snapshot doesn't complete normally
+// Close cancels snapshot work and releases its sessions. It waits for the
+// operation only until ctx is done; deferred cleanup continues after a timeout.
+// Calling Close from a snapshot callback is safe and does not join that callback.
 func (s *Snapshotter) Close(ctx context.Context) {
 	if s == nil {
 		return
 	}
 	s.cancelMu.Lock()
 	s.closed = true
+	done := s.operationDone
 	if s.operationCancel != nil {
 		s.operationCancel()
 	}
 	s.cancelMu.Unlock()
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+	}
 	s.closeAllConnections(ctx, false)
 }
 
@@ -310,11 +385,15 @@ func (s *Snapshotter) runOperation(ctx context.Context, fn func(context.Context)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s.operationCancel = cancel
+	done := make(chan struct{})
+	s.operationDone = done
 	s.cancelMu.Unlock()
 	defer func() {
 		cancel()
 		s.cancelMu.Lock()
 		s.operationCancel = nil
+		s.operationDone = nil
+		close(done)
 		s.cancelMu.Unlock()
 	}()
 	return fn(ctx)

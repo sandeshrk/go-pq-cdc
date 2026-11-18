@@ -518,7 +518,7 @@ func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
 		return errors.Wrap(err, "prepare exact snapshot")
 	}
 	c.stream.OpenFromSnapshotLSN()
-	if err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), c.cfg.Slot.Name); err != nil {
+	if err := c.snapshotter.ExecuteWithContext(ctx, c.snapshotHandler, c.cfg.Slot.Name); err != nil {
 		return errors.Wrap(err, "execute snapshot; restart connector for a fresh snapshot")
 	}
 	return nil
@@ -539,7 +539,7 @@ func (c *connector) executeSnapshotOnly(ctx context.Context) error {
 	}
 
 	// Execute snapshot (collect data from all chunks)
-	if err := c.snapshotter.Execute(ctx, c.snapshotHandlerFor(ctx), slotName); err != nil {
+	if err := c.snapshotter.ExecuteWithContext(ctx, c.snapshotHandler, slotName); err != nil {
 		return errors.Wrap(err, "execute snapshot")
 	}
 
@@ -582,24 +582,15 @@ func (c *connector) shouldTakeSnapshotOnly(ctx context.Context) bool {
 	return false
 }
 
-// snapshotHandlerFor returns a snapshot.Handler bound to ctx, since
-// snapshot.Handler itself carries no context parameter. Without this, a
-// listener reading ListenerContext.Context off a snapshot event sees nil
-// instead of a real context, unlike every live-replication event.
-func (c *connector) snapshotHandlerFor(ctx context.Context) snapshot.Handler {
-	return func(event *format.Snapshot) error {
-		c.listenerFunc(&replication.ListenerContext{
-			Context: ctx,
-			Message: event,
-			Ack: func() error {
-				return nil // ACK isn't required for snapshot
-			},
-			AckLSN: func(pq.LSN) error {
-				return nil // ACK isn't required for snapshot
-			},
-		})
-		return nil
-	}
+// snapshotHandler delivers events with the operation context so Close cancels
+// downstream waits independently of the caller run context.
+func (c *connector) snapshotHandler(ctx context.Context, event *format.Snapshot) error {
+	c.listenerFunc(&replication.ListenerContext{
+		Context: ctx, Message: event,
+		Ack:    func() error { return nil },
+		AckLSN: func(pq.LSN) error { return nil },
+	})
+	return nil
 }
 
 // ErrConnectorClosedBeforeReady is returned by WaitUntilReady when the
